@@ -14,7 +14,7 @@ benchmarks are explicit commands, never build-time side effects.
    face system and recovers the body update by back-substitution.
 2. **Measure and improve HDG efficiency.** Establish speedups through isolated
    single-thread paired tests at equal accuracy, reporting mean accepted
-   quasi-Newton-update time and converged total-solve time, including all
+   Newton-update time and converged total-solve time, including all
    setup, condensation, recovery, and common DG-residual work. Report the
    configurations where HDG is faster or slower; DOF reduction alone is not
    a timing result.
@@ -31,10 +31,12 @@ The equation of state is created in `src/main.cpp` as `EulerGas gas(3.)`.
 its pressure, flux, Jacobian, and HLL methods read them directly. `Gamma()`
 provides read-only access. `Problem` owns a copy shared by its DG/HDG paths,
 with no process-global gas state. The ideal-gas kernels support gamma > 1;
-the current rotated exact-solution case explicitly requires gamma=3.
+the rotated exact-solution formulas also use variable gamma. The selected test
+problem supplies gamma when constructing `EulerGas` (currently 3 in main);
+gamma is not a CLI option and stays constant for that problem's run.
 CSV output reports the configured value.
 
-- Euler gamma=3 simple wave, default angle 45 degrees. Change `--alpha-deg` in
+- Euler simple wave, problem-specified gamma=3 and default angle 45 degrees. Change `--alpha-deg` in
   `(0,90)`; the centered domain is
   `[-1/cos(alpha),1/cos(alpha)] x [-1/sin(alpha),1/sin(alpha)]`.
 - `nx x ny` affine quadrilateral Qk elements, native MFEM Gauss-Legendre nodal
@@ -45,13 +47,18 @@ CSV output reports the configured value.
 - Periodicity is imposed by Cartesian face pairing, including opposite domain
   boundaries. Exported MFEM geometry is the centered rectangular mesh; its mesh
   topology itself is not converted to a periodic MFEM mesh.
-- Einfeldt/Roe HLL bounds (`--safety 1.1`) are recomputed at each nonlinear
-  residual state, including line-search trials, and frozen only in each
-  quasi-Newton linear solve. DG and HDG use the same frozen linearization.
+- Einfeldt/Roe HLL bounds (`--safety 1.1`) are fixed throughout each implicit
+  solve, including all Newton iterations and line-search trials. Backward
+  Euler uses the beginning-of-step state; each DIRK stage uses its initial
+  guess (the previous stage solution after stage zero). Stage zero reuses
+  the beginning-of-step CFL estimate. DG and HDG use the same policy.
+  Newton differentiates the residual with these bounds held constant; flux
+  Jacobians still follow the current iterate. GMRES and line search make this
+  an inexact, damped Newton solve of the fixed-bound stage equation.
 - The default `ssp-dirk3` uses a four-stage third-order DIRK tableau.
   `--integrator be` retains backward Euler as a diagnostic.
 - Initial data use an accurate local L2 projection. Exact smooth errors are
-  evaluated before shock formation, `T < 1/pi`; the default endpoint is `0.2`.
+  evaluated before shock formation, `T < 4/((gamma+1)*pi)`; the default endpoint is `0.2`.
 
 See [MATHEMATICS.md](MATHEMATICS.md) for equations, inverse-mass weighting, and
 DG/HDG update equivalence; [DESIGN.md](DESIGN.md) for storage and performance.
@@ -108,16 +115,16 @@ directory once to pick up this clean rule.
 `amax=max_faces,q(max(-SL,SR))`, **including safety**, so `dt=C*h/amax`.
 There is no hidden `2k+1` factor. `--steps N` overrides `--T` and does not clip
 the last step. In T mode the last step is clipped, so its actual CFL can be
-smaller. Every chosen endpoint must remain below `1/pi`.
+smaller. Every chosen endpoint must remain below `4/((gamma+1)*pi)`.
 
 `--newton-steps N` performs exactly N damped Newton updates per DIRK stage
 (four stages per time step for the default method);
 this is a controlled workload, not a claim of nonlinear convergence. Without
-it, use `--max-newton` (25) and `--newton-tol` (1e-10). The convergence norm is
+it, use `--max-newton` (30) and `--newton-tol` (1e-12). The convergence norm is
 the physical cell dual L2 residual divided by dt and by sqrt(domain area).
 Both paths use the same positivity/Armijo line search on the DG residual.
 
-GMRES uses `--restart 20`, `--max-krylov 1500`, `--linear-tol 1e-11`.
+GMRES uses `--restart 20`, `--max-krylov 1500`, `--linear-tol 1e-12`.
 Right PCs are `block-jacobi` (default) and `block-ilu0`. For ILU, use
 `--ilu-ordering none` (default) or `mdf` (one-time MDF on the unweighted fixed
 topology graph). The graph, ordering and ILU update schedule are prepared before
@@ -180,9 +187,17 @@ converged-Newton DG/HDG update-equivalence test;
 `speed_test/` contains timing and resource experiments. Each driver defaults to
 the output area owned by its category.
 
+All test categories use `--newton-tol 1e-12` and `--linear-tol 1e-12`.
+The solver defaults and the accuracy driver's defaults match these settings;
+the correctness and speed drivers pass them explicitly. Fixed-update speed
+tests still use their prescribed Newton update counts, so the Newton tolerance
+does not terminate those updates; the linear tolerance remains active.
+Existing binaries must be rebuilt to acquire changed C++ defaults, and stored
+results retain the tolerances actually used when they were generated.
+
 ```sh
 python code_test/test_solver.py --exe ./build/euler2d
-python speed_test/benchmark.py --exe ./build/euler2d --nx 16 --ny 16 --k 3 --cfl 1 --steps 3 --newton-steps 3
+python speed_test/benchmark.py --exe ./build/euler2d --nx 16 --ny 16 --k 3 --cfl 1
 python accuracy_test/convergence.py --exe ./build-intel/euler2d --grids 8 16 32 --T .2 --cfl .1
 # Independent cases may run concurrently; resulting times are not benchmarks:
 python accuracy_test/convergence.py --exe ./build-intel/euler2d --grids 32 64 128 256 --T .2 --cfl .5 --jobs 8
@@ -198,6 +213,17 @@ thread counts for common BLAS libraries, checks update counts and reports the
 median of each run's mean Newton time. Failures stop the comparison rather
 than being included as zero-time samples. High-order local LU memory/cost can
 still dominate; measure before drawing DG/HDG speed conclusions.
+
+Speed tests use one backward-Euler step (`--integrator be --steps 1`) and
+exactly three Newton updates (`--newton-steps 3`), for both DG and HDG.
+This controlled workload compares mean accepted-Newton-update wall time;
+three updates do not imply nonlinear convergence. Accuracy tests retain DIRK.
+Slurm cases write to `speed_test/results/be_newton3/job_<ID>/k<k>_<precond>/`.
+Submit with `bash speed_test/submit.sh`; each submission creates its own
+manifest under `speed_test/results/be_newton3/`. After completion, run
+`python speed_test/collect.py` for the CSV/Markdown summaries in that directory,
+or add `--update-results` to update the backward-Euler section of `RESULTS.md`.
+Existing DIRK measurements retain their original paths and configuration.
 
 ## Validation status
 

@@ -34,7 +34,9 @@ def main():
 
     def run(name, flags):
         prefix = root / name
-        result = subprocess.run([exe, "--output", str(prefix), *map(str, flags)],
+        result = subprocess.run([exe, "--output", str(prefix),
+                                 "--newton-tol", "1e-12", "--linear-tol", "1e-12",
+                                 *map(str, flags)],
                                 text=True, capture_output=True)
         (root / f"{name}.log").write_text(result.stdout + result.stderr,
                                             encoding="utf-8")

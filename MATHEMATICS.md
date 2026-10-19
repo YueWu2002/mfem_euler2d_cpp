@@ -4,17 +4,25 @@ This implementation follows the frozen-HLL construction and paired Gram metric
 in `../../GPT/note.pdf`, sections 2.4, 3.1 and 3.2.1. The two sibling C++ projects
 are implementation references; they do not define a different quadrature here.
 
-## Rotated gamma=3 simple wave
+## Rotated ideal-gas simple wave (gamma > 1)
+
+Gamma is supplied by the test problem through `EulerGas`; it is not a command-
+line parameter. The current problem selects gamma=3, while the formulas below
+retain their dependence on gamma.
 
 Let `d=(cos(alpha),sin(alpha))`, `z=d dot (x,y)`, and solve
 
 \[
- \xi+t\sin(\pi\xi)=z \pmod 2,\qquad j=\sin(\pi\xi).
+ \xi+t\left[\frac{3-\gamma}{2}+\frac{\gamma+1}{4}\sin(\pi\xi)\right]
+ =z \pmod 2,\qquad j=\sin(\pi\xi).
 \]
 
-Then `v=1+j/2`, `rho=(1-j/2)/sqrt(3)`, `p=rho^3`,
-`U=(rho,rho*v*d_x,rho*v*d_y,rho^3/2+rho*v^2/2)`.
-The first shock time is `1/pi`. Each domain translation changes z by 2, so
+Fix the Riemann invariant `J_+=v+2c/(gamma-1)=2`, with `J_-=j`.
+Then `v=1+j/2`, `c=(gamma-1)*(2-j)/4`,
+`rho=(c^2/gamma)^(1/(gamma-1))`, `p=rho^gamma`, and
+`U=(rho,rho*v*d_x,rho*v*d_y,p/(gamma-1)+rho*v^2/2)`.
+The first shock time is `4/((gamma+1)*pi)` (equal to `1/pi` for the
+default gamma=3). Each domain translation changes z by 2, so
 periodicity is compatible with every supported angle, not only pi/4.
 The supported box has positive lengths and requires `0<alpha<pi/2`.
 
@@ -70,36 +78,39 @@ With square-root-density Roe averages,
  b=\eta\max(0,c_R+v_{n,R},\widetilde c+\widetilde v_n),\qquad\eta=1.1.
 \]
 
-Here `c=sqrt(3p/rho)`, and Roe sound speed comes from the averaged total
+Here `c=sqrt(gamma*p/rho)`, and Roe sound speed comes from the averaged total
 enthalpy and full velocity. These are exactly the reference implementations'
-Einfeldt bounds. Recompute a,b from the current state for every nonlinear
-residual, including line-search trial states. Freeze a,b only in the linear
-solve at that state: the matrix omits derivatives of the bounds and is thus a
-quasi-Newton matrix. The converged stage solves the current-state HLL residual,
-not an old-time frozen-flux equation. DG and condensed HDG use exactly the
-same frozen-bound matrix at each update; all bound-dependent HDG blocks are
-invalidated whenever the bounds change. CFL uses the beginning-of-step bounds.
+Einfeldt bounds. Estimate a,b once at the initial guess of each implicit
+solve and keep them fixed in all residuals, Jacobians and line-search trials
+for that solve. Backward Euler freezes at U_n. DIRK stage zero reuses the
+beginning-of-step CFL bounds; subsequent stages estimate bounds from the
+previous stage solution, which is their initial guess. The affine stage base
+need not be the state used to estimate wave speeds. DG and condensed HDG use
+the same policy. State-dependent flux Jacobians still refresh at each Newton
+state; the fixed bounds themselves are not differentiated.
 
-### Accuracy limitation of the former whole-step freezing
+For a stage residual R(U,s), let s_* denote these fixed HLL bounds. Newton
+solves R(U,s_*)=0 with Jacobian R_U(U,s_*); there is no wave-speed derivative
+term because s_* is constant throughout the solve. State-dependent Euler flux
+derivatives are retained. With finite-tolerance GMRES and backtracking this is
+an inexact, damped Newton method for the fixed-bound equation.
 
-Write the spatial ODE as `U'=F(U,s(U))`, where `s` collects the HLL bounds.
-The former implementation instead applied the RK tableau to `U'=F(U,s(U_n))`.
-For differentiable bounds, the exact second-order Taylor coefficient is
-`(F_U + F_s s_U) F / 2`, while the frozen step contains only `F_U F / 2`.
-Thus the local defect generically contains
-`Delta t^2 F_s s_U F / 2`: fixed-grid global time accuracy is only first
-order, even though the tableau satisfies all third-order RK conditions.
-At switches in the max-based bounds this smooth Taylor argument is local;
-For consistent HLL fluxes, sensitivity to the bounds vanishes when left and
-right states coincide. This explains why the freezing error can be small on
-spatial refinement and hidden beneath the spatial error.
+If instead bounds were updated as s(U) while their derivatives were omitted,
+the matrix would omit R_s s_U from the full derivative. That is an approximate-
+Jacobian Newton iteration, not full Newton for R(U,s(U)); quadratic convergence
+would not generally follow. It is not necessarily slow when the omitted term
+is small. The fixed-bound and state-dependent-bound equations are different.
 
-Freezing through all stages is different from freezing only within a stage's
-nonlinear solve with suitably accurate stage-dependent speed predictions.
-The current implementation removes this defect by solving with state-dependent
-bounds, while retaining frozen bounds in the quasi-Newton matrix. DG/HDG
-equivalence was retested. The CLI name `ssp-dirk3` does not itself
-establish an SSP/positivity theorem for the complete scheme.
+### Accuracy of stage-frozen bounds
+
+Each stage now solves a frozen-bound equation. This is a change from evaluating
+wave speeds at every nonlinear trial state. The third-order RK tableau alone
+does not establish third-order accuracy for the resulting stage-dependent
+frozen-flux scheme; the speed prediction also affects consistency and order.
+Accuracy and DG/HDG equivalence must be rechecked with the updated code.
+Previously collected results with state-dependent bounds do not validate this
+new policy. The CLI name `ssp-dirk3` does not itself establish an
+SSP/positivity theorem for the complete scheme.
 
 ### Oriented numerical flux
 
@@ -243,6 +254,14 @@ The HDG Gram is `H_trace=diag(ell_f*w_q)`, counting each global face once.
 A physically scaled cell residual is `r_w/dt`; therefore nonlinear convergence
 uses `sqrt(r_stored^T M r_stored)/dt/sqrt(domain area)`. The common relative
 DG linear-residual criterion is unchanged by division by the same dt.
+
+The current Newton and GMRES tolerance settings for all test categories are
+both 1e-12. Newton stops when the above physical residual RMS satisfies
+`R <= 1e-12 * max(1, R_initial)`; here dt is the DIRK stage time step
+`a_ii * dt_step`. Thus the criterion is absolute for initial RMS below one
+and relative otherwise. Fixed-update timing tests bypass this Newton stopping
+test but retain the GMRES tolerance. Changing these tolerances does not change
+the residual norm or the reported absolute solution-error norms.
 
 Using inverse M again on the **already mass-inverted** DG residual would apply
 the wrong metric. Dropping ell_f in the skeleton weight is likewise wrong

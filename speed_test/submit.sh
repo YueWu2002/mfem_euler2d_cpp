@@ -3,9 +3,9 @@ set -euo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "${PROJECT_ROOT}"
-mkdir -p speed_test/slurm speed_test/results
+mkdir -p speed_test/slurm speed_test/results/be_newton3
 
-MANIFEST=speed_test/submitted_jobs.csv
+MANIFEST="speed_test/results/be_newton3/submitted_jobs_$(date +%Y%m%dT%H%M%S)_$$.csv"
 printf 'sequence,job_id,k,preconditioner\n' > "${MANIFEST}"
 
 # Submission order only; scheduler start order is not guaranteed.

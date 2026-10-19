@@ -44,11 +44,9 @@ public:
         auto &l = jl[id]; auto &r = jr[id];
         p.gas.jacobian(p.Eval(u, f.l, p.fv[f.ls], q), f.axis, l);
         p.gas.jacobian(p.Eval(u, f.r, p.fv[f.rs], q), f.axis, r);
-        double a = f.a[q], b = f.b[q];
-        const double inverse_sum = 1. / (a + b);
-        const double left_weight = b * inverse_sum;
-        const double right_weight = a * inverse_sum;
-        const double penalty = a * b * inverse_sum;
+        const double left_weight = f.left_weight[q];
+        const double right_weight = f.right_weight[q];
+        const double penalty = f.penalty[q];
         for (int d = 0; d < 4; d++) {
 #pragma omp simd
           for (int c = 0; c < 4; c++) {

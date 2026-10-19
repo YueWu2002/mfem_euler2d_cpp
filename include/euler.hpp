@@ -44,10 +44,10 @@ public:
 // Body layout: (cell, GL node, conservative component).
 // Trace layout: (periodic face, GL node, conservative component).
 struct Options {
-  int nx = 100, ny = 100, k = 1, volume_order = -1, max_newton = 25;
+  int nx = 100, ny = 100, k = 1, volume_order = -1, max_newton = 30;
   int restart = 20, max_krylov = 1500, newton_steps = -1, steps = -1;
-  double alpha = 45, dt = .001, end = .2, cfl = -1, safety = 1.1, tol = 1e-10,
-         linear_tol = 1e-11;
+  double alpha = 45, dt = .001, end = .2, cfl = -1, safety = 1.1, tol = 1e-12,
+         linear_tol = 1e-12;
   std::string assembly = "partial";
   std::string form = "both", solver = "gmres", precond = "block-jacobi",
               integrator = "ssp-dirk3", output = "code_test/results/run";
@@ -63,9 +63,11 @@ struct Face {
   int l = -1, r = -1, ls = -1, rs = -1, axis = 0;
   double length = 0.;
   std::vector<double> a, b;
+  // Frozen-bound HLL weights shared by residual and Jacobian kernels.
+  std::vector<double> inverse_sum, left_weight, right_weight, penalty;
 };
 // Qk face restriction: one normal-direction contraction per tangential GL node.
-// Shared interpolation tables; only 4x4 flux blocks are stored per face node.
+// Shared interpolation tables; C stores 4x4 blocks, B scalar identity factors.
 class FaceCoupling {
 public:
   const std::array<std::vector<std::vector<std::pair<int,double>>>,4> *basis = nullptr;
@@ -73,6 +75,8 @@ public:
   int nodes = 0, cell_size = 0;
   bool lift = false;
   std::vector<Matrix4> flux;
+  // Lift B is scalar times I_4; restriction C retains full flux blocks.
+  std::vector<double> scalar_flux;
   int Height() const { return lift ? cell_size : 16*nodes; }
   int Width() const { return lift ? 16*nodes : cell_size; }
   void Mult(const Vector &x, Vector &y) const;
@@ -137,6 +141,7 @@ struct Hybrid {
   std::vector<FaceCoupling> B, C;
   std::vector<std::vector<int>> ids;
   int freeze_generation = -1;
+  double cached_dt = -1.;
 };
 // X_e = A_e^{-1} B_e; y_e = A_e^{-1} r_e.
 // X stores solves with local LU, never an explicitly formed inverse of A_e.

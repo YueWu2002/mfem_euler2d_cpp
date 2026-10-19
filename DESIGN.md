@@ -5,7 +5,7 @@
 | Module | Responsibility |
 |---|---|
 | `euler.hpp` | Types, dimensions, reusable workspace interfaces and ownership |
-| `physics.cpp` | Gamma=3 flux/Jacobian, Einfeldt speeds, rotated exact wave |
+| `physics.cpp` | Variable-gamma ideal-gas flux/Jacobian, Einfeldt speeds, rotated exact wave |
 | `problem.cpp` | MFEM geometry/GL basis, residuals, local blocks, metrics |
 | `partial.cpp` | Refreshable DG quadrature Jacobian cache and analytic action |
 | `operators.cpp` | Element/factored actions, diagonal panels, optional CSR |
@@ -87,20 +87,37 @@ The partial DG diagonal builder applies these inverse-mass row weights while
 accumulating sparse face terms directly into the cell block, avoiding two
 full dense face-scratch clears/scales for every face.
 
-HDG B and D depend on frozen wave speeds and dt. Bounds now follow each
-nonlinear residual state, so a freeze-generation counter invalidates B and D
-after every bound refresh; A and C refresh at every quasi-Newton state.
+HDG B depends on frozen wave speeds and dt; D depends on frozen wave speeds.
+Bounds are fixed per implicit
+stage; the freeze-generation counter invalidates cached D and B at each stage.
+B additionally checks the actual stage dt, including stage zero after CFL
+selection and clipped final steps. Both are reused within the stage.
+A and C refresh at every Newton state. Wave-speed estimation is omitted from
+Newton and line-search loops, and stage zero reuses the CFL estimate.
+The resulting matrix differentiates the fixed-bound stage residual; this is
+Newton with inexact GMRES solves and damping, rather than a state-dependent-
+wave-speed residual paired with an approximate Jacobian.
+Stage wave-speed estimation is included in total time-loop timing, outside
+the per-Newton-update timer; state-dependent assembly and condensation remain
+inside the update timer.
 Nodal trace collocation lets A face terms accumulate directly into the cell
-matrix. B/C store only four-component flux blocks per face GL node and borrow
+matrix. C stores four-component flux blocks per face GL node; B stores one
+scalar identity multiplier per node, and both borrow
 the shared normal-direction interpolation tables. C first restricts along a
 tensor line, then applies the flux block; B applies its flux block and lifts
 along the same line with diagonal mass scaling. Thus B/C storage per cell is
 O(k+1), and their vector actions are O((k+1)^2), rather than dense
 O((k+1)^3) work. B is expanded directly into the cached X buffer only for
 the multi-RHS local solve; no persistent dense B or C is stored.
-This counter is valid because production changes dt
-only alongside Freeze, before the HDG refresh at that nonlinear state.
-Public callers changing dt themselves must Freeze again before reuse.
+Frozen HLL inverse sums, left/right weights and penalties are computed once
+in Freeze and shared by residual, trace and DG Jacobian kernels. These caches
+do not contain dt, so CFL selection after Freeze does not invalidate them.
+B's separate dt key prevents reuse after a stage-step change even without a
+new wave-speed estimate. Direct mutation of face bounds still requires Freeze.
+The scalar B payload is 1/16 of its former 4x4-block payload; this is not a
+1/16 reduction in total HDG memory. A/C, LU and X still refresh each Newton.
+Frozen coefficient preparation performed at the first HDG update remains
+inside that update's timer; it is not moved into untimed setup.
 
 Schur Jacobi extraction applies only the matching face restriction C_s to the
 matching X_s panel, forming four t-by-t products instead of a 4t-by-4t product.

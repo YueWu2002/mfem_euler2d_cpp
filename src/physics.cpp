@@ -62,14 +62,17 @@ std::array<double, 2> EulerGas::speeds(const State &l, const State &r, int axis,
           safety * std::max({0., cr + r[axis + 1] * inverse_r, ct + v[axis]})};
 }
 State EulerGas::exact(double x, double y, double time, double alpha) const {
-  require(gamma == 3., "Rotated simple-wave exact case requires gamma=3");
-  require(time >= 0 && time * pi < 1, "Exact solution requires T<1/pi");
-  // Solve xi + t*sin(pi*xi) = phase using bracketed Newton.
+  const double drift = (3. - gamma) / 2., amplitude = (gamma + 1.) / 4.;
+  require(time >= 0 && time * pi * amplitude < 1,
+          "Exact solution requires T < 4/((gamma+1)*pi)");
+  // J_+=2, J_-=sin(pi*xi): solve the left-going characteristic map.
   double phase = std::cos(alpha) * x + std::sin(alpha) * y;
   phase -= 2 * std::floor((phase + 1) / 2);
-  double lo = phase - time, hi = phase + time, z = phase;
+  phase -= time * drift;
+  phase -= 2 * std::floor((phase + 1) / 2);
+  double lo = phase - time * amplitude, hi = phase + time * amplitude, z = phase;
   for (int i = 0; i < 80; i++) {
-    double r = z + time * std::sin(pi * z) - phase;
+    double r = z + time * amplitude * std::sin(pi * z) - phase;
     if (std::abs(r) < 2e-15) {
       break;
     }
@@ -78,11 +81,14 @@ State EulerGas::exact(double x, double y, double time, double alpha) const {
     } else {
       lo = z;
     }
-    double q = z - r / (1 + time * pi * std::cos(pi * z));
+    double q = z - r / (1 + time * amplitude * pi * std::cos(pi * z));
     z = (q >= lo && q <= hi) ? q : .5 * (lo + hi);
   }
-  double jm = std::sin(pi * z), v = 1 + .5 * jm, rho = (1 - .5 * jm) / std::sqrt(gamma);
+  const double jm = std::sin(pi * z), v = 1 + .5 * jm;
+  const double sound = gamma_minus_one * (2. - jm) / 4.;
+  const double rho = std::pow(sound * sound / gamma, 1. / gamma_minus_one);
+  const double pressure = std::pow(rho, gamma);
   return {rho, rho * v * std::cos(alpha), rho * v * std::sin(alpha),
-          rho * rho * rho / gamma_minus_one + .5 * rho * v * v};
+          pressure / gamma_minus_one + .5 * rho * v * v};
 }
 } // namespace euler

@@ -20,13 +20,13 @@ def main():
     p.add_argument("--ny", type=int, default=16)
     p.add_argument("--k", type=int, default=3)
     p.add_argument("--cfl", type=float, default=1.)
-    p.add_argument("--steps", type=int, default=3)
-    p.add_argument("--newton-steps", type=int, default=3)
+    p.add_argument("--steps", type=int, choices=[1], default=1)
+    p.add_argument("--newton-steps", type=int, choices=[3], default=3)
     p.add_argument("--repeat", type=int, default=5)
     p.add_argument("--precond", choices=["block-jacobi", "block-ilu0"], default="block-jacobi")
     p.add_argument("--assembly", choices=["partial", "element", "full"], default="partial")
-    p.add_argument("--integrator", choices=["ssp-dirk3", "be"], default="ssp-dirk3")
-    p.add_argument("--output", default="speed_test/results/benchmark")
+    p.add_argument("--integrator", choices=["be"], default="be")
+    p.add_argument("--output", default="speed_test/results/be_newton3/benchmark")
     args = p.parse_args()
     if args.repeat < 1:
         p.error("--repeat must be positive")
@@ -47,6 +47,7 @@ def main():
             command = [exe, "--form", form, "--nx", str(args.nx), "--ny", str(args.ny),
                 "--k", str(args.k), "--cfl", str(args.cfl), "--steps", str(args.steps),
                 "--newton-steps", str(args.newton_steps), "--precond", args.precond,
+                "--newton-tol", "1e-12", "--linear-tol", "1e-12",
                 "--assembly", args.assembly, "--integrator", args.integrator,
                 "--timing-only", "--output", str(prefix)]
             result = subprocess.run(command, text=True, capture_output=True, env=env)

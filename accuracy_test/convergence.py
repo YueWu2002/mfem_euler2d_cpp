@@ -20,8 +20,8 @@ def main():
     parser.add_argument("--grids", nargs="+", type=int, default=[32, 64, 128, 256, 512])
     parser.add_argument("--T", type=float, default=0.2)
     parser.add_argument("--cfl", type=float, default=2.0)
-    parser.add_argument("--newton-tol", type=float, default=1e-13)
-    parser.add_argument("--linear-tol", type=float, default=1e-13)
+    parser.add_argument("--newton-tol", type=float, default=1e-12)
+    parser.add_argument("--linear-tol", type=float, default=1e-12)
     parser.add_argument("--output", default="accuracy_test/convergence_order/convergence_k2")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Independent serial cases in parallel; concurrent timings are not benchmarks")

@@ -28,6 +28,8 @@ def main():
 
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    if any(output.iterdir()):
+        raise RuntimeError(f"Output directory must be empty: {output}")
     exe = str(Path(args.exe).resolve())
     env = dict(os.environ)
     for name in ["OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -41,7 +43,8 @@ def main():
         prefix = output / f"cfl{cfl:g}_{form}"
         command = [exe, "--nx", "256", "--ny", "256", "--k", str(args.k),
                    "--cfl", str(cfl), "--steps", "1", "--form", form,
-                   "--integrator", "ssp-dirk3", "--newton-steps", "3",
+                   "--integrator", "be", "--newton-steps", "3",
+                   "--newton-tol", "1e-12", "--linear-tol", "1e-12",
                    "--solver", "gmres", "--assembly", "partial",
                    "--precond", args.precond, "--timing-only",
                    "--output", str(prefix)]
@@ -67,8 +70,9 @@ def main():
             raise RuntimeError(
                 f"{form} failed at k={args.k}, CFL={cfl}: {result.stderr}")
         data = summary(Path(f"{prefix}_{form}_summary.csv"))
-        expected = 4 * 3  # four DIRK stages, three fixed updates per stage
-        if int(data["newton_updates"]) != expected:
+        expected = 3  # one backward-Euler step, three fixed Newton updates
+        if (int(data["newton_updates"]) != expected
+                or data["integrator"] != "be" or int(data["time_steps"]) != 1):
             raise RuntimeError("Unexpected Newton update count")
         rows.append({
             "k": args.k,
@@ -77,7 +81,8 @@ def main():
             "nx": 256,
             "ny": 256,
             "cfl": cfl,
-            "dirk_stages": 4,
+            "integrator": "be",
+            "dirk_stages": 1,
             "newton_updates_per_stage": 3,
             "measured_newton_updates": expected,
             "mean_newton_s": data["mean_newton_s"],

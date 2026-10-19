@@ -77,7 +77,6 @@ void FaceCoupling::Mult(const Vector &x, Vector &y) const {
   for (int side=0; side<4; ++side) {
     for (int q=0; q<nodes; ++q) {
       const auto &restriction = (*basis)[side][q];
-      const auto &a = flux[side*nodes+q];
       double value[4] = {}, result[4] = {};
       const int offset = 4*(side*nodes+q);
       if (lift) {
@@ -88,9 +87,16 @@ void FaceCoupling::Mult(const Vector &x, Vector &y) const {
           for (int c=0; c<4; ++c) { value[c]+=entry.second*x[4*entry.first+c]; }
         }
       }
-      for (int d=0; d<4; ++d) {
+      if (lift) {
+        const double a = scalar_flux[side*nodes+q];
 #pragma omp simd
-        for (int c=0; c<4; ++c) { result[c]+=a(c,d)*value[d]; }
+        for (int c=0; c<4; ++c) { result[c]=a*value[c]; }
+      } else {
+        const auto &a = flux[side*nodes+q];
+        for (int d=0; d<4; ++d) {
+#pragma omp simd
+          for (int c=0; c<4; ++c) { result[c]+=a(c,d)*value[d]; }
+        }
       }
       if (lift) {
         for (const auto &entry : restriction) {
@@ -120,10 +126,14 @@ void FaceCoupling::Dense(DenseMatrix &a) const {
       for (const auto &entry : (*basis)[side][q]) {
         double weight=entry.second;
         if (lift) { weight*=(*inverse_mass)(entry.first,entry.first); }
-        for (int d=0; d<4; ++d) {
-          for (int c=0; c<4; ++c) {
-            if (lift) { a(4*entry.first+c,offset+d)=weight*flux[side*nodes+q](c,d); }
-            else { a(offset+c,4*entry.first+d)=weight*flux[side*nodes+q](c,d); }
+        if (lift) {
+          const double value = weight*scalar_flux[side*nodes+q];
+          for (int c=0; c<4; ++c) { a(4*entry.first+c,offset+c)=value; }
+        } else {
+          for (int d=0; d<4; ++d) {
+            for (int c=0; c<4; ++c) {
+              a(offset+c,4*entry.first+d)=weight*flux[side*nodes+q](c,d);
+            }
           }
         }
       }

@@ -40,7 +40,8 @@ Problem::Problem(const Options &o, const EulerGas &equation_of_state)
       trace_fec(o.k, 1, mfem::BasisType::GaussLegendre),
       fes(&mesh, &fec), fe(fes.GetFE(0)) {
   old.SetSize(nu);
-  require(gas.Gamma() == 3., "Rotated simple-wave exact case requires gamma=3");
+  require(o.steps > 0 || o.end < 4 / ((gas.Gamma() + 1) * pi),
+          "Exact solution requires T < 4/((gamma+1)*pi)");
   require(fe->GetDof() == p, "Expected native Qk element");
   require(o.alpha > 0 && o.alpha < 90, "Angle must be strictly between 0 and 90 degrees");
   // Shift the actual MFEM mesh, including exported geometry, to the requested box.
@@ -76,8 +77,8 @@ Problem::Problem(const Options &o, const EulerGas &equation_of_state)
   for (int iy = 0; iy < o.ny; iy++) {
     for (int ix = 0; ix < o.nx; ix++) {
       int l = grid[iy * o.nx + ix];
-      Face fx{l, grid[iy * o.nx + (ix + 1) % o.nx], 1, 0, 0, hy, {}, {}},
-          fy{l, grid[((iy + 1) % o.ny) * o.nx + ix], 3, 2, 1, hx, {}, {}};
+      Face fx{l, grid[iy * o.nx + (ix + 1) % o.nx], 1, 0, 0, hy, {}, {}, {}, {}, {}, {}},
+          fy{l, grid[((iy + 1) % o.ny) * o.nx + ix], 3, 2, 1, hx, {}, {}, {}, {}, {}, {}};
       for (Face f : {fx, fy}) {
         int id = faces.size();
         f.a.resize(o.k+1); f.b.resize(o.k+1);
@@ -356,12 +357,20 @@ void Problem::Freeze(const Vector &u, double step, bool check_admissible) {
   for (auto &f : faces) {
     f.a.resize(opt.k + 1);
     f.b.resize(opt.k + 1);
+    f.inverse_sum.resize(opt.k + 1);
+    f.left_weight.resize(opt.k + 1);
+    f.right_weight.resize(opt.k + 1);
+    f.penalty.resize(opt.k + 1);
     for (int q = 0; q <= opt.k; q++) {
       auto s = gas.speeds(Eval(u, f.l, fv[f.ls], q), Eval(u, f.r, fv[f.rs], q), f.axis,
                       opt.safety);
       f.a[q] = s[0];
       f.b[q] = s[1];
       require(s[0] + s[1] > 0, "Degenerate HLL speeds");
+      f.inverse_sum[q] = 1. / (s[0] + s[1]);
+      f.left_weight[q] = s[1] * f.inverse_sum[q];
+      f.right_weight[q] = s[0] * f.inverse_sum[q];
+      f.penalty[q] = s[0] * s[1] * f.inverse_sum[q];
     }
   }
 }
@@ -388,7 +397,7 @@ Vector Problem::Trace(const Vector &u) const {
       const auto &fc = faces[f];
       auto l = Eval(u, fc.l, fv[fc.ls], q), r = Eval(u, fc.r, fv[fc.rs], q),
            fl = gas.flux(l, fc.axis), fr = gas.flux(r, fc.axis);
-      const double inverse_sum = 1. / (fc.a[q] + fc.b[q]);
+      const double inverse_sum = fc.inverse_sum[q];
       for (int i = 0; i <= opt.k; i++) {
 #pragma omp simd
         for (int c = 0; c < 4; c++) {
@@ -455,10 +464,9 @@ void Problem::Residual(const Vector &u, Vector &r, const Vector *lam) const {
       auto l = Eval(u, fc.l, fv[fc.ls], q), v = Eval(u, fc.r, fv[fc.rs], q),
            fl = gas.flux(l, fc.axis), fr = gas.flux(v, fc.axis);
       State hl{}, hr{}, lv{};
-      const double inverse_sum = 1. / (fc.a[q] + fc.b[q]);
-      const double left_flux_weight = fc.b[q] * inverse_sum;
-      const double right_flux_weight = fc.a[q] * inverse_sum;
-      const double penalty = fc.a[q] * fc.b[q] * inverse_sum;
+      const double left_flux_weight = fc.left_weight[q];
+      const double right_flux_weight = fc.right_weight[q];
+      const double penalty = fc.penalty[q];
       if (lam) {
         for (int i = 0; i <= opt.k; i++) {
 #pragma omp simd
@@ -553,11 +561,9 @@ std::unique_ptr<ElementOperator> Problem::DG(const Vector &u) const {
       auto &jl = face_left; auto &jr = face_right;
       gas.jacobian(Eval(u, f.l, fv[f.ls], q), f.axis, jl);
       gas.jacobian(Eval(u, f.r, fv[f.rs], q), f.axis, jr);
-      double a = f.a[q], b = f.b[q];
-      const double inverse_sum = 1. / (a + b);
-      const double left_weight = b * inverse_sum;
-      const double right_weight = a * inverse_sum;
-      const double penalty = a * b * inverse_sum;
+      const double left_weight = f.left_weight[q];
+      const double right_weight = f.right_weight[q];
+      const double penalty = f.penalty[q];
       for (int d = 0; d < 4; d++) {
 #pragma omp simd
         for (int c = 0; c < 4; c++) {
@@ -591,7 +597,8 @@ Hybrid Problem::HDG(const Vector &u) const {
 }
 void Problem::HybridDiagonal(Hybrid &h) const {
   h.D.SetSize(nl);
-  // Refresh face stabilization with the current frozen Newton state.
+  h.B.resize(n);
+  // Reuse face stabilization until the next implicit stage freezes new bounds.
   const bool refresh_static = h.freeze_generation != freeze_generation;
   if (refresh_static) {
     for (int f = 0; f < nf; ++f) {
@@ -605,6 +612,25 @@ void Problem::HybridDiagonal(Hybrid &h) const {
     }
   }
 
+  // B depends on the actual stage dt, which may be set after CFL Freeze.
+  if (refresh_static || h.cached_dt != dt) {
+    for (int e = 0; e < n; ++e) {
+      auto &b = h.B[e];
+      b.basis = &face_basis; b.inverse_mass = &inv_mass;
+      b.nodes = opt.k+1; b.cell_size = m; b.lift = true;
+      b.scalar_flux.resize(4*(opt.k+1));
+      for (int side = 0; side < 4; ++side) {
+        const auto &face = faces[cell_faces[e][side]];
+        const bool left = face.l == e && face.ls == side;
+        for (int q = 0; q <= opt.k; ++q) {
+          const double scale = dt * face.length / area * ew[q];
+          b.scalar_flux[side*(opt.k+1)+q] =
+              -scale * (left ? face.a[q] : face.b[q]);
+        }
+      }
+    }
+    h.cached_dt = dt;
+  }
   h.freeze_generation=freeze_generation;
 }
 void Problem::HDG(const Vector &u, Hybrid &h) const {
@@ -615,14 +641,13 @@ void Problem::HDG(const Vector &u, Hybrid &h) const {
 }
 void Problem::HybridCell(const Vector &u,int e,Hybrid &h,DenseMatrix &a) const {
   VolumeJacobianCell(u,e,a);
-    for (auto *coupling : {&h.B[e], &h.C[e]}) {
-      coupling->basis = &face_basis;
-      coupling->inverse_mass = &inv_mass;
-      coupling->nodes = opt.k+1;
-      coupling->cell_size = m;
-      coupling->flux.resize(4*(opt.k+1));
-    }
-    h.B[e].lift = true; h.C[e].lift = false;
+    auto &coupling = h.C[e];
+    coupling.basis = &face_basis;
+    coupling.inverse_mass = &inv_mass;
+    coupling.nodes = opt.k+1;
+    coupling.cell_size = m;
+    coupling.flux.resize(4*(opt.k+1));
+    coupling.lift = false;
     if (h.ids[e].empty()) {
       h.ids[e].reserve(4*t);
       for (int side = 0; side < 4; ++side) {
@@ -669,8 +694,6 @@ void Problem::HybridCell(const Vector &u,int e,Hybrid &h,DenseMatrix &a) const {
         }
         for (int d=0; d<4; ++d) {
           for (int c=0; c<4; ++c) {
-            h.B[e].flux[side*(opt.k+1)+q](c,d) =
-                c==d ? -scale*stabilization : 0.;
             h.C[e].flux[side*(opt.k+1)+q](c,d) = -ew[q]*derivative(c,d);
           }
         }

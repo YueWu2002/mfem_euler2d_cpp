@@ -5,7 +5,7 @@ int main(int argc, char **argv) {
   using namespace euler;
   try {
     Options o = ParseOptions(argc, argv);
-    const EulerGas gas(3.); // Equation of state for the selected simple-wave case.
+    const EulerGas gas(3.); // Gamma belongs to the selected test problem.
     auto parent = std::filesystem::path(o.output).parent_path();
     if (!parent.empty()) {
       std::filesystem::create_directories(parent);

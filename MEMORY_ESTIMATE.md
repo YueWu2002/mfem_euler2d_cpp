@@ -1,5 +1,9 @@
 # Q8 Block-Jacobi 存储估算
 
+后续速度测试已改为 backward Euler 单时间步、固定 3 次 Newton 更新。
+本文下方的 DIRK 容量估算及已收集记录对应旧实验；新的 BE 实测应另行记录，
+原始数据位于 `speed_test/results/be_newton3/job_<ID>/k<k>_<precond>/`。
+
 适用算例：二维 Euler DG，`256 x 256` 网格，`Q8`，SSP-DIRK(4,3)，
 GMRES restart 20，双精度，以及每个单元一个完整稠密 Block-Jacobi 块。
 这是一份容量估算；它不替代 Slurm 的最终 `MaxRSS` 测量。
@@ -40,10 +44,9 @@ GMRES restart 或四阶段 DIRK 本身。
 当前 partial-DG 路径不显式保存全局 Jacobian；Block-Jacobi 的单元对角块
 在 LU 分解时原位覆盖。因而上表的“原位 LU”列对应当前实现的主要存储模型。
 
-已观察到 `k=8`、Block-Jacobi 算例的进程峰值 RSS 为 **58.99 GiB**。这与
-57–59 GiB 的原位-LU估算相符，但只能说明数量级一致，不能单独证明不存在
-额外临时副本。应以完成后的 `sacct`/`MaxRSS` 为准；申请内存仍需为分配器、
-局部工作区与运行波动留出余量。
+`k=8` Block-Jacobi 的最终 DG 峰值 RSS 为 **60.136 GiB**，HDG 为
+**28.434 GiB**；此前 58.99 GiB 是运行中采样值。最终值包含估算未覆盖的
+局部工作区等开销。Slurm 计算 step 的最终 MaxRSS 为 **60.263 GiB**。
 
 ## 边界条件
 
@@ -54,38 +57,34 @@ GMRES restart 或四阶段 DIRK 本身。
 
 ## Speed-test 运行记录
 
-每个作业分别执行 DG 与 HDG。结果收集时，从对应 case 目录的
-`cfl5_dg_resources.json`、`cfl5_hdg_resources.json` 和 `resources.csv` 填写
-峰值 RSS 与墙钟时间；完成后再用 `sacct` 核对作业级 `MaxRSS`。`进程最大值`
-取 DG、HDG 两项峰值中的较大者。
+采集日期：2026-10-19。18 个作业均已结束，16 个成功、2 个 DG 阶段 OOM；失败作业未执行 HDG。
+CPU：Intel(R) Xeon(R) Gold 6242 CPU @ 2.80GHz；节点均为 node1601，单线程。
 
-同一份 JSON 还记录每个求解器进程的用户 CPU 时间和系统 CPU 时间。CPU 效率
-按 `(user_cpu_s + system_cpu_s) / wall_s` 计算；接近 `100%` 表示单线程计算
-过程基本持续占满一个逻辑 CPU。
+数据来自各 case 的 resources.csv、result.csv 和 sacct。CPU 时间为 user + system，
+效率为 CPU / wall × 100%。进程峰值由 /usr/bin/time 测量；Slurm MaxRSS 单列保留，
+取计算 step `.0` 的记账值。Slurm TotalCPU 返回零或仅 batch 开销，本次 CPU 数据采用进程测量。
 
-### 节点 CPU 信息
+| job ID | k | preconditioner | 申请 (GiB) | DG RSS (GiB) | HDG RSS (GiB) | 进程最大值 (GiB) | Slurm MaxRSS (GiB) | DG CPU/wall (s) | HDG CPU/wall (s) | DG/HDG 效率 | 状态/退出码 |
+|---:|---:|---|---:|---:|---:|---:|---:|---|---|---|---|
+| 7583428 | 8 | block-jacobi | 364 | 60.136 | 28.434 | 60.136 | 60.263 | 16482.31 / 16552.07 | 5699.35 / 5723.66 | 99.58% / 99.58% | COMPLETED 0:0 |
+| 7583429 | 8 | block-ilu0 | 120 | 119.748 | — | 119.748 | 119.986 | 89.15 / 89.50 | — | 99.61% / — | FAILED 1:0; DG OOM 137 |
+| 7583430 | 7 | block-jacobi | 120 | 39.050 | 20.671 | 39.050 | 39.133 | 9531.43 / 9566.69 | 4243.25 / 4259.16 | 99.63% / 99.63% | COMPLETED 0:0 |
+| 7583431 | 7 | block-ilu0 | 120 | 119.749 | — | 119.749 | 119.987 | 87.20 / 87.51 | — | 99.65% / — | FAILED 1:0; DG OOM 137 |
+| 7583432 | 6 | block-jacobi | 120 | 24.203 | 14.495 | 24.203 | 24.246 | 5425.08 / 5448.50 | 2561.92 / 2572.16 | 99.57% / 99.60% | COMPLETED 0:0 |
+| 7583433 | 6 | block-ilu0 | 120 | 99.365 | 19.211 | 99.365 | 99.555 | 5389.77 / 5409.98 | 1414.85 / 1419.94 | 99.63% / 99.64% | COMPLETED 0:0 |
+| 7583434 | 5 | block-jacobi | 120 | 14.174 | 9.732 | 14.174 | 14.192 | 3021.19 / 3031.77 | 1517.58 / 1522.74 | 99.65% / 99.66% | COMPLETED 0:0 |
+| 7583435 | 5 | block-ilu0 | 120 | 54.778 | 13.223 | 54.778 | 54.876 | 2650.18 / 2660.91 | 878.91 / 882.30 | 99.60% / 99.62% | COMPLETED 0:0 |
+| 7583436 | 4 | block-jacobi | 120 | 7.741 | 6.176 | 7.741 | 7.746 | 1741.97 / 1748.07 | 1001.68 / 1005.32 | 99.65% / 99.64% | COMPLETED 0:0 |
+| 7583437 | 4 | block-ilu0 | 120 | 27.355 | 8.635 | 27.355 | 27.399 | 1336.82 / 1342.49 | 557.72 / 560.01 | 99.58% / 99.59% | COMPLETED 0:0 |
+| 7583438 | 3 | block-jacobi | 120 | 3.880 | 3.654 | 3.880 | 3.878 | 714.00 / 716.92 | 464.01 / 465.88 | 99.59% / 99.60% | COMPLETED 0:0 |
+| 7583439 | 3 | block-ilu0 | 120 | 11.950 | 5.265 | 11.950 | 11.963 | 492.66 / 494.40 | 305.63 / 306.78 | 99.65% / 99.63% | COMPLETED 0:0 |
+| 7583440 | 2 | block-jacobi | 120 | 1.738 | 1.967 | 1.967 | 1.961 | 338.30 / 339.41 | 303.19 / 304.31 | 99.67% / 99.63% | COMPLETED 0:0 |
+| 7583441 | 2 | block-ilu0 | 120 | 4.321 | 2.917 | 4.321 | 4.320 | 194.06 / 194.77 | 180.67 / 181.33 | 99.64% / 99.64% | COMPLETED 0:0 |
+| 7583442 | 1 | block-jacobi | 120 | 0.671 | 0.938 | 0.938 | 0.931 | 76.73 / 77.05 | 94.25 / 94.65 | 99.58% / 99.58% | COMPLETED 0:0 |
+| 7583443 | 1 | block-ilu0 | 120 | 1.213 | 1.416 | 1.416 | 1.409 | 47.36 / 47.55 | 71.42 / 71.71 | 99.60% / 99.60% | COMPLETED 0:0 |
+| 7583444 | 0 | block-jacobi | 120 | 0.204 | 0.378 | 0.378 | 0.370 | 18.63 / 18.73 | 44.41 / 44.61 | 99.47% / 99.55% | COMPLETED 0:0 |
+| 7583445 | 0 | block-ilu0 | 120 | 0.272 | 0.569 | 0.569 | 0.561 | 10.87 / 10.94 | 28.41 / 28.53 | 99.36% / 99.58% | COMPLETED 0:0 |
 
-| node | CPU 型号 | 逻辑 CPU 数 | sockets | cores/socket | threads/core | NUMA nodes | 采集日期 |
-|---|---|---:|---:|---:|---:|---:|---|
-| node1601 | Intel(R) Xeon(R) Gold 6242 CPU @ 2.80GHz | 32 | 2 | 16 | 1 | 2 | 2026-10-19 |
-
-| job ID | k | preconditioner | node | 申请内存 (GiB) | DG peak RSS (GiB) | HDG peak RSS (GiB) | 进程最大值 (GiB) | DG CPU/wall (s) | HDG CPU/wall (s) | DG/HDG CPU效率 | 状态/退出码 | 备注 |
-|---:|---:|---|---|---:|---:|---:|---:|---|---|---|---|---|
-| 7583428 | 8 | block-jacobi | node1601 | 364 | — | — | 58.99 (运行中采样) | — | — | — | RUNNING | 最终值待作业结束后填写 |
-| 7583429 | 8 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583430 | 7 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583431 | 7 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583432 | 6 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583433 | 6 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583434 | 5 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583435 | 5 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583436 | 4 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583437 | 4 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583438 | 3 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583439 | 3 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583440 | 2 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583441 | 2 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583442 | 1 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583443 | 1 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583444 | 0 | block-jacobi | — | 120 | — | — | — | — | — | — | PENDING | |
-| 7583445 | 0 | block-ilu0 | — | 120 | — | — | — | — | — | — | PENDING | |
+OOM 行的 RSS 仅表示失败前达到的内存，不能作为完成运行的内存需求。原始数据保留在
+`speed_test/results/k<k>_<preconditioner>/`；正式耗时汇总见
+`speed_test/results/CPU time per Newton step.csv` 与同名 `.md`。

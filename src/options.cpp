@@ -95,7 +95,7 @@ Options ParseOptions(int argc, char **argv) {
     }
   }
   require(o.nx >= 2 && o.ny >= 2 && o.k >= 0 && o.k <= 8 && o.dt > 0 && o.end >= 0 &&
-              o.end < 1 / pi && o.safety >= 1 && o.tol > 0 && o.linear_tol > 0,
+              o.safety >= 1 && o.tol > 0 && o.linear_tol > 0,
           "Invalid mesh, degree, time or safety");
   long double cells = static_cast<long double>(o.nx) * o.ny, q = o.k + 1.L;
   require(4 * cells * q * q <= std::numeric_limits<int>::max() &&

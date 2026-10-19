@@ -57,7 +57,8 @@ void Problem::PrepareHybrid(Hybrid &h, Condensed &s) const {
       coupling->inverse_mass = &inv_mass;
       coupling->nodes = opt.k+1;
       coupling->cell_size = m;
-      coupling->flux.resize(4*(opt.k+1));
+      if (coupling == &h.B[e]) { coupling->scalar_flux.resize(4*(opt.k+1)); }
+      else { coupling->flux.resize(4*(opt.k+1)); }
     }
     h.B[e].lift = true; h.C[e].lift = false;
     s.X[e].SetSize(m,4*t); s.y[e].SetSize(m);

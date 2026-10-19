@@ -80,7 +80,7 @@ RunResult Run(Problem &p, const std::string &form, const std::string &prefix) {
   const double ssp_c[4] = {alpha, 0., 1., .5};
   bool final_step = time >= o.end;
   while (o.steps > 0 ? step < o.steps : !final_step) {
-    // Old-time bounds select dt; stage residuals use current-state bounds.
+    // Beginning-of-step bounds select dt and also serve the first stage.
     step_state = out.u;
     // Initial, accepted Newton, and reconstructed DIRK states are checked at
     // their creation sites, so this time-level state is already admissible.
@@ -91,20 +91,22 @@ RunResult Run(Problem &p, const std::string &form, const std::string &prefix) {
       final_step = time + dt >= o.end;
       if (final_step) { dt = o.end - time; }
     }
-    require(std::isfinite(dt) && dt > 0 && time + dt < 1 / pi,
-            "Step leaves the smooth simple-wave interval T < 1/pi");
+    require(std::isfinite(dt) && dt > 0 && time + dt < 4 / ((p.gas.Gamma()+1)*pi),
+            "Step leaves the smooth simple-wave interval T < 4/((gamma+1)*pi)");
     const int stage_count = o.integrator == "be" ? 1 : 4;
     for (int stage = 0; stage < stage_count; ++stage) {
       const double diagonal = o.integrator == "be" ? 1. : ssp_a[stage][stage];
-      p.dt = diagonal*dt;
       stage_base = step_state;
       if (o.integrator != "be") {
         for (int j = 0; j < stage; ++j) {
           stage_base.Add(dt*ssp_a[stage][j],slope[j]);
         }
       }
-      // Refresh bounds with each nonlinear state, but freeze them in the
-      // linearized DG/HDG solve (a common quasi-Newton Jacobian).
+      // Freeze at the stage's initial guess (previous stage solution for
+      // stage > 0). Keep these bounds for every Newton and line-search state.
+      // Stage zero reuses the beginning-of-step estimate used for CFL.
+      if (stage > 0) { p.Freeze(out.u, diagonal*dt, false); }
+      p.dt = diagonal*dt;
       p.old = stage_base;
       const double physical_scale = 1 / (p.dt * std::sqrt(p.lx * p.ly));
       const double old_norm = p.CellNorm(stage_base);
@@ -114,10 +116,6 @@ RunResult Run(Problem &p, const std::string &form, const std::string &prefix) {
       for (int it = 0; it <= limit; ++it) {
         double istart = clock_s();
         if (!residual_ready) {
-          // Every stage initial guess and accepted line-search state has already
-          // passed Admissible(); avoid scanning all volume and face states twice.
-          p.Freeze(out.u, diagonal*dt, false);
-          p.old = stage_base;
           p.Residual(out.u,residual);
         }
         const double residual_norm = p.CellNorm(residual);
@@ -207,8 +205,6 @@ RunResult Run(Problem &p, const std::string &form, const std::string &prefix) {
           trial = out.u;
           trial.Add(damping, du);
           if (p.Admissible(trial)) {
-            p.Freeze(trial, diagonal*dt, false);
-            p.old = stage_base;
             p.Residual(trial,trial_residual);
             if (p.CellNorm(trial_residual) <=
                   (1 - 1e-4*damping)*residual_norm + allowance) {
@@ -270,7 +266,7 @@ RunResult Run(Problem &p, const std::string &form, const std::string &prefix) {
   if (o.save_solution) { p.Save(out.u, prefix); }
   std::ofstream summary(prefix + "_summary.csv");
   require(bool(summary), "Cannot open summary output");
-  summary << "form,nx,ny,k,integrator,stages,T,dt,cfl,"
+  summary << "form,nx,ny,k,gamma,integrator,stages,T,dt,cfl,"
              "actual_max_cfl,mean_dt,"
              "volume_dofs,trace_dofs,matrix_free,assembly,solver,preconditioner,"
              "ilu_ordering,requested_steps,fixed_newton_steps,time_steps,"
@@ -279,6 +275,7 @@ RunResult Run(Problem &p, const std::string &form, const std::string &prefix) {
           << std::setprecision(17);
   const double mean = out.updates ? out.newton_seconds / out.updates : 0.;
   summary << form << ',' << o.nx << ',' << o.ny << ',' << o.k << ','
+          << p.gas.Gamma() << ','
           << o.integrator << ',' << (o.integrator == "be" ? 1 : 4) << ','
           << time << ',' << o.dt << ',' << o.cfl << ',' << max_cfl << ','
           << (step ? dt_sum/step : 0.) << ',' << p.nu << ',' << p.nl << ','

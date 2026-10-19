@@ -6,16 +6,23 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--update-results", action="store_true")
+parser.add_argument("--root", type=Path,
+                    default=Path(__file__).resolve().parent / "results" / "be_newton3")
 args = parser.parse_args()
-root = Path(__file__).resolve().parent / "results"
+root = args.root.resolve()
+root.mkdir(parents=True, exist_ok=True)
 rows = []
-for path in sorted(root.glob("k*_*/result.csv")):
+for path in sorted(root.glob("job_*/k*_*/result.csv")):
     with path.open(newline="", encoding="utf-8") as stream:
         data = list(csv.DictReader(stream))
     if len(data) != 2:
         raise RuntimeError(f"Expected DG and HDG rows in {path}")
     by_form = {row["form"]: row for row in data}
     dg, hdg = by_form["dg"], by_form["hdg"]
+    for row in data:
+        if (row.get("integrator") != "be"
+                or int(row["measured_newton_updates"]) != 3):
+            raise RuntimeError(f"Expected backward Euler with 3 updates: {path}")
     rows.append({
         "k": int(dg["k"]),
         "preconditioner": dg["preconditioner"],
@@ -40,8 +47,8 @@ headers = list(rows[0]) if rows else ["k", "preconditioner", "CFL",
     "DG CPU time per Newton step (s)", "HDG CPU time per Newton step (s)",
     "DG/HDG", "DG peak RSS (GiB)", "HDG peak RSS (GiB)", "node", "job_id"]
 lines = ["### CPU time per Newton step", "",
-         "Configuration: 256x256, CFL=5.0, SSP-DIRK3, four stages, three fixed",
-         "Newton updates per stage (12 measured updates), matrix-free partial",
+         "Configuration: 256x256, CFL=5.0, one backward-Euler time step,",
+         "three fixed Newton updates (3 measured updates), matrix-free partial",
          "assembly, restarted weighted right GMRES (restart dimension 20, "
          "maximum 1500 Krylov iterations), and one process/thread.", "",
          "Peak RSS is measured per solver process over its complete lifetime,",
@@ -53,7 +60,7 @@ for row in rows:
 if not rows:
     lines.append("| " + " | ".join(["—"] * len(headers)) + " |")
 memory_rows = []
-for path in sorted(root.glob("k*_*/resources.csv")):
+for path in sorted(root.glob("job_*/k*_*/resources.csv")):
     with path.open(newline="", encoding="utf-8") as stream:
         memory_rows.extend(csv.DictReader(stream))
 memory_rows.sort(key=lambda row: (int(row["k"]), row["preconditioner"], row["form"]))
@@ -68,9 +75,9 @@ if not memory_rows:
 markdown = "\n".join(lines) + "\n"
 (root / "CPU time per Newton step.md").write_text(markdown)
 if args.update_results:
-    target = root.parent.parent / "RESULTS.md"
+    target = Path(__file__).resolve().parent.parent / "RESULTS.md"
     content = target.read_text()
-    start, end = "<!-- speed-test-results:start -->", "<!-- speed-test-results:end -->"
+    start, end = "<!-- speed-test-be-results:start -->", "<!-- speed-test-be-results:end -->"
     if content.count(start) != 1 or content.count(end) != 1:
         raise RuntimeError("Expected exactly one speed-test table marker pair")
     first = content.index(start) + len(start)
