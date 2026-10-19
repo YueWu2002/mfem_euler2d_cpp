@@ -5,15 +5,16 @@ int main(int argc, char **argv) {
   using namespace euler;
   try {
     Options o = ParseOptions(argc, argv);
+    const EulerGas gas(3.); // Equation of state for the selected simple-wave case.
     auto parent = std::filesystem::path(o.output).parent_path();
     if (!parent.empty()) {
       std::filesystem::create_directories(parent);
     }
     if (o.verify) {
-      Verify(o);
+      Verify(o, gas);
       return 0;
     }
-    Problem p(o);
+    Problem p(o, gas);
     RunResult dg, hdg;
     if (o.form == "both" && o.hdg_first) {
       hdg = Run(p, "hdg", o.output + "_hdg");
@@ -30,9 +31,16 @@ int main(int argc, char **argv) {
       Vector d = dg.u;
       d -= hdg.u;
       double diff = d.Normlinf();
+      const auto l2 = p.Differences(dg.u, hdg.u);
+      double combined_l2 = 0.;
+      for (double value : l2) { combined_l2 += value*value; }
+      combined_l2 = std::sqrt(combined_l2);
       std::ofstream f(o.output + "_comparison.csv");
-      f << "max_nodal_difference,rho_L2_difference,dg_over_hdg_mean_newton\n"
-        << std::setprecision(17) << diff << ',' << p.Difference(dg.u, hdg.u) << ','
+      f << "max_nodal_difference,rho_L2_difference,rhou_L2_difference,"
+           "rhov_L2_difference,energy_L2_difference,solution_L2_difference,"
+           "dg_over_hdg_mean_newton\n"
+        << std::setprecision(17) << diff << ',' << l2[0] << ',' << l2[1] << ','
+        << l2[2] << ',' << l2[3] << ',' << combined_l2 << ','
         << (dg.updates && hdg.updates && hdg.newton_seconds > 0
                ? (dg.newton_seconds / dg.updates) / (hdg.newton_seconds / hdg.updates) : 0.) << '\n';
       std::cout << "DG/HDG max nodal difference=" << diff << '\n';

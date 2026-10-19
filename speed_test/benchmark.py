@@ -25,7 +25,8 @@ def main():
     p.add_argument("--repeat", type=int, default=5)
     p.add_argument("--precond", choices=["block-jacobi", "block-ilu0"], default="block-jacobi")
     p.add_argument("--assembly", choices=["partial", "element", "full"], default="partial")
-    p.add_argument("--output", default="results/benchmark")
+    p.add_argument("--integrator", choices=["ssp-dirk3", "be"], default="ssp-dirk3")
+    p.add_argument("--output", default="speed_test/results/benchmark")
     args = p.parse_args()
     if args.repeat < 1:
         p.error("--repeat must be positive")
@@ -37,6 +38,7 @@ def main():
                  "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"]:
         env[name] = "1"
     values = {"dg": [], "hdg": []}
+    loop_values = {"dg": [], "hdg": []}
     samples = []
     for repeat in range(-1, args.repeat):
         forms = ["dg", "hdg"] if repeat % 2 == 0 else ["hdg", "dg"]
@@ -45,26 +47,33 @@ def main():
             command = [exe, "--form", form, "--nx", str(args.nx), "--ny", str(args.ny),
                 "--k", str(args.k), "--cfl", str(args.cfl), "--steps", str(args.steps),
                 "--newton-steps", str(args.newton_steps), "--precond", args.precond,
-                "--assembly", args.assembly, "--timing-only", "--output", str(prefix)]
+                "--assembly", args.assembly, "--integrator", args.integrator,
+                "--timing-only", "--output", str(prefix)]
             result = subprocess.run(command, text=True, capture_output=True, env=env)
             (root / f"r{repeat}_{form}.log").write_text(result.stdout + result.stderr, encoding="utf-8")
             if result.returncode:
                 raise RuntimeError(f"Benchmark failed: {command}\n{result.stderr}")
             with Path(f"{prefix}_{form}_summary.csv").open(newline="") as stream:
                 row = next(csv.DictReader(stream))
-            expected = args.steps*args.newton_steps
+            stages = 4 if args.integrator == "ssp-dirk3" else 1
+            expected = args.steps*args.newton_steps*stages
             if int(row["newton_updates"]) != expected:
                 raise AssertionError("Unexpected Newton update count")
             if repeat >= 0:
                 value = float(row["mean_newton_s"])
                 values[form].append(value)
+                loop_value = float(row["time_loop_s"])
+                loop_values[form].append(loop_value)
                 samples.append({"repeat": repeat, "form": form, "mean_newton_s": value,
-                                "newton_updates": expected})
+                                "time_loop_s": loop_value, "newton_updates": expected})
     with (root / "samples.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=samples[0].keys())
         writer.writeheader(); writer.writerows(samples)
     dg, hdg = (statistics.median(values[f]) for f in ["dg", "hdg"])
+    dg_loop, hdg_loop = (statistics.median(loop_values[f]) for f in ["dg", "hdg"])
     print(f"median mean Newton seconds: DG={dg:.8g}, HDG={hdg:.8g}; DG/HDG={dg/hdg:.5g}")
+    print(f"median total time-loop seconds: DG={dg_loop:.8g}, HDG={hdg_loop:.8g}; "
+          f"DG/HDG={dg_loop/hdg_loop:.5g}")
 
 
 if __name__ == "__main__":

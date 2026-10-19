@@ -14,10 +14,14 @@ void add_face(DenseMatrix &a, const DenseMatrix &row, const DenseMatrix &col, in
   for (int i = 0; i < row.Width(); i++) {
     for (int h = 0; h < col.Width(); h++) {
       if (row(q, i) != 0 && col(q, h) != 0) {
-        for (int c = 0; c < 4; c++) {
-          for (int d = 0; d < 4; d++) {
+        const double weight = scale * row(q, i) * col(q, h);
+        // DenseMatrix and Matrix4 are column-major: keep the row component
+        // contiguous and independent for the SIMD lane.
+        for (int d = 0; d < 4; d++) {
+#pragma omp simd
+          for (int c = 0; c < 4; c++) {
             a(ro + 4 * i + c, co + 4 * h + d) +=
-                scale * row(q, i) * col(q, h) * j(c, d);
+                weight * j(c, d);
           }
         }
       }
@@ -25,8 +29,8 @@ void add_face(DenseMatrix &a, const DenseMatrix &row, const DenseMatrix &col, in
   }
 }
 } // namespace
-Problem::Problem(const Options &o)
-    : opt(o), alpha(o.alpha * pi / 180),
+Problem::Problem(const Options &o, const EulerGas &equation_of_state)
+    : opt(o), gas(equation_of_state), alpha(o.alpha * pi / 180),
       lx(2 / std::cos(alpha)), ly(2 / std::sin(alpha)),
       hx(lx / o.nx), hy(ly / o.ny), area(hx * hy), n(o.nx * o.ny),
       p((o.k + 1) * (o.k + 1)), m(4 * p), t(4 * (o.k + 1)), nf(2 * n), nu(n * m),
@@ -36,6 +40,7 @@ Problem::Problem(const Options &o)
       trace_fec(o.k, 1, mfem::BasisType::GaussLegendre),
       fes(&mesh, &fec), fe(fes.GetFE(0)) {
   old.SetSize(nu);
+  require(gas.Gamma() == 3., "Rotated simple-wave exact case requires gamma=3");
   require(fe->GetDof() == p, "Expected native Qk element");
   require(o.alpha > 0 && o.alpha < 90, "Angle must be strictly between 0 and 90 degrees");
   // Shift the actual MFEM mesh, including exported geometry, to the requested box.
@@ -171,6 +176,26 @@ Problem::Problem(const Options &o)
       }
       require(volume_node[q] >= 0, "GL quadrature/nodal ordering mismatch");
     }
+    const int n1=o.k+1;
+    tensor_node.assign(p,-1); tensor_quad.assign(p,-1);
+    for (int q=0; q<nq; ++q) {
+      const auto &point=ir.IntPoint(q);
+      int ix=-1, iy=-1;
+      for (int j=0; j<n1; ++j) {
+        if (std::abs(point.x-edge.IntPoint(j).x)<1e-12) { ix=j; }
+        if (std::abs(point.y-edge.IntPoint(j).x)<1e-12) { iy=j; }
+      }
+      require(ix>=0 && iy>=0, "Volume GL rule is not a tensor product");
+      tensor_node[iy*n1+ix]=volume_node[q];
+      tensor_quad[iy*n1+ix]=q;
+    }
+    tensor_dx.SetSize(n1); tensor_dy.SetSize(n1);
+    for (int a=0; a<n1; ++a) {
+      for (int i=0; i<n1; ++i) {
+        tensor_dx(a,i)=Gx(tensor_quad[a],tensor_node[i]);
+        tensor_dy(a,i)=Gy(tensor_quad[a*n1],tensor_node[i*n1]);
+      }
+    }
   }
   for (int side = 0; side < 4; ++side) {
     face_basis[side].resize(o.k + 1);
@@ -233,13 +258,13 @@ State Problem::Eval(const Vector &u, int e, const DenseMatrix &v, int q) const {
 bool Problem::Admissible(const Vector &u) const {
   for (int e = 0; e < n; e++) {
     for (int q = 0; q < V.Height(); q++) {
-      if (!positive(Eval(u, e, V, q))) {
+      if (!gas.positive(Eval(u, e, V, q))) {
         return false;
       }
     }
     for (int s = 0; s < 4; s++) {
       for (int q = 0; q <= opt.k; q++) {
-        if (!positive(Eval(u, e, fv[s], q))) {
+        if (!gas.positive(Eval(u, e, fv[s], q))) {
           return false;
         }
       }
@@ -250,8 +275,10 @@ bool Problem::Admissible(const Vector &u) const {
 void Problem::MassSolve(DenseMatrix &a) const {
   if (collocated) {
     for (int i = 0; i < p; ++i) {
-      for (int c = 0; c < 4; ++c) {
-        for (int j = 0; j < a.Width(); ++j) { a(4*i+c,j) *= inv_mass(i,i); }
+      const double scale = inv_mass(i,i);
+      for (int j = 0; j < a.Width(); ++j) {
+#pragma omp simd
+        for (int c = 0; c < 4; ++c) { a(4*i+c,j) *= scale; }
       }
     }
     return;
@@ -261,9 +288,11 @@ void Problem::MassSolve(DenseMatrix &a) const {
   for (int i = 0; i < p; i++) {
     for (int j = 0; j < p; j++) {
       if (inv_mass(i, j) != 0) {
-        for (int c = 0; c < 4; c++) {
-          for (int h = 0; h < a.Width(); h++) {
-            z(4 * i + c, h) += inv_mass(i, j) * a(4 * j + c, h);
+        const double scale = inv_mass(i, j);
+        for (int h = 0; h < a.Width(); h++) {
+#pragma omp simd
+          for (int c = 0; c < 4; c++) {
+            z(4 * i + c, h) += scale * a(4 * j + c, h);
           }
         }
       }
@@ -275,6 +304,7 @@ void Problem::MassSolve(Vector &r) const {
   if (collocated) {
     for (int e = 0; e < n; ++e) {
       for (int i = 0; i < p; ++i) {
+#pragma omp simd
         for (int c = 0; c < 4; ++c) { r[e*m+4*i+c] *= inv_mass(i,i); }
       }
     }
@@ -305,7 +335,7 @@ Vector Problem::Initial() const {
     for (int q = 0; q < ir.GetNPoints(); q++) {
       auto &ip = ir.IntPoint(q);
       fe->CalcShape(ip, sh);
-      auto v = exact(origx[e] + hx * ip.x, origy[e] + hy * ip.y, 0, alpha);
+      auto v = gas.exact(origx[e] + hx * ip.x, origy[e] + hy * ip.y, 0, alpha);
       for (int i = 0; i < p; i++) {
         for (int c = 0; c < 4; c++) {
           u[e * m + 4 * i + c] += ip.weight * sh[i] * v[c];
@@ -316,16 +346,18 @@ Vector Problem::Initial() const {
   MassSolve(u);
   return u;
 }
-void Problem::Freeze(const Vector &u, double step) {
+void Problem::Freeze(const Vector &u, double step, bool check_admissible) {
   ++freeze_generation;
-  require(Admissible(u), "Old state is inadmissible; refine mesh");
+  if (check_admissible) {
+    require(Admissible(u), "Old state is inadmissible; refine mesh");
+  }
   old = u;
   dt = step;
   for (auto &f : faces) {
     f.a.resize(opt.k + 1);
     f.b.resize(opt.k + 1);
     for (int q = 0; q <= opt.k; q++) {
-      auto s = speeds(Eval(u, f.l, fv[f.ls], q), Eval(u, f.r, fv[f.rs], q), f.axis,
+      auto s = gas.speeds(Eval(u, f.l, fv[f.ls], q), Eval(u, f.r, fv[f.rs], q), f.axis,
                       opt.safety);
       f.a[q] = s[0];
       f.b[q] = s[1];
@@ -344,6 +376,7 @@ double Problem::WaveRate() const {
 double Problem::CellNorm(const Vector &r) const {
   require(r.Size() == nu, "Cell norm size mismatch");
   double norm = 0.;
+#pragma omp simd reduction(+:norm)
   for (int i = 0; i < nu; ++i) { norm += cell_metric[i] * r[i] * r[i]; }
   return std::sqrt(norm);
 }
@@ -354,12 +387,14 @@ Vector Problem::Trace(const Vector &u) const {
     for (int q = 0; q <= opt.k; q++) {
       const auto &fc = faces[f];
       auto l = Eval(u, fc.l, fv[fc.ls], q), r = Eval(u, fc.r, fv[fc.rs], q),
-           fl = flux(l, fc.axis), fr = flux(r, fc.axis);
+           fl = gas.flux(l, fc.axis), fr = gas.flux(r, fc.axis);
+      const double inverse_sum = 1. / (fc.a[q] + fc.b[q]);
       for (int i = 0; i <= opt.k; i++) {
+#pragma omp simd
         for (int c = 0; c < 4; c++) {
           lam[f * t + 4 * i + c] += psi(q, i) *
-                                    (fc.a[q] * l[c] + fc.b[q] * r[c] + fl[c] - fr[c]) /
-                                    (fc.a[q] + fc.b[q]);
+                                    (fc.a[q] * l[c] + fc.b[q] * r[c] + fl[c] - fr[c]) *
+                                    inverse_sum;
         }
       }
     }
@@ -373,14 +408,16 @@ Vector Problem::Skeleton(const Vector &u, const Vector &lam) const {
     for (int q = 0; q <= opt.k; q++) {
       const auto &fc = faces[f];
       auto l = Eval(u, fc.l, fv[fc.ls], q), r = Eval(u, fc.r, fv[fc.rs], q),
-           fl = flux(l, fc.axis), fr = flux(r, fc.axis);
+           fl = gas.flux(l, fc.axis), fr = gas.flux(r, fc.axis);
       State lv{};
       for (int i = 0; i <= opt.k; i++) {
+#pragma omp simd
         for (int c = 0; c < 4; c++) {
           lv[c] += psi(q, i) * lam[f * t + 4 * i + c];
         }
       }
       for (int i = 0; i <= opt.k; i++) {
+#pragma omp simd
         for (int c = 0; c < 4; c++) {
           g[f * t + 4 * i + c] += ew[q] * psi(q, i) *
                                   ((fc.a[q] + fc.b[q]) * lv[c] - fc.a[q] * l[c] -
@@ -401,10 +438,13 @@ void Problem::Residual(const Vector &u, Vector &r, const Vector *lam) const {
   r = 0.;
   for (int e = 0; e < n; e++) {
     for (int q = 0; q < V.Height(); q++) {
-      auto v = Eval(u, e, V, q), fx = flux(v, 0), fy = flux(v, 1);
+      auto v = Eval(u, e, V, q), fx = gas.flux(v, 0), fy = gas.flux(v, 1);
       for (const auto &test : volume_tests[q]) {
+        double *cell = r.GetData() + e*m + 4*test.node;
+        const double weight = dt*w[q];
+#pragma omp simd
         for (int c = 0; c < 4; c++) {
-          r[e*m+4*test.node+c] -= dt*w[q]*(test.dx*fx[c] + test.dy*fy[c]);
+          cell[c] -= weight*(test.dx*fx[c] + test.dy*fy[c]);
         }
       }
     }
@@ -413,32 +453,43 @@ void Problem::Residual(const Vector &u, Vector &r, const Vector *lam) const {
     for (int q = 0; q <= opt.k; q++) {
       const auto &fc = faces[f];
       auto l = Eval(u, fc.l, fv[fc.ls], q), v = Eval(u, fc.r, fv[fc.rs], q),
-           fl = flux(l, fc.axis), fr = flux(v, fc.axis);
+           fl = gas.flux(l, fc.axis), fr = gas.flux(v, fc.axis);
       State hl{}, hr{}, lv{};
+      const double inverse_sum = 1. / (fc.a[q] + fc.b[q]);
+      const double left_flux_weight = fc.b[q] * inverse_sum;
+      const double right_flux_weight = fc.a[q] * inverse_sum;
+      const double penalty = fc.a[q] * fc.b[q] * inverse_sum;
       if (lam) {
         for (int i = 0; i <= opt.k; i++) {
+#pragma omp simd
           for (int c = 0; c < 4; c++) {
             lv[c] += psi(q, i) * (*lam)[f * t + 4 * i + c];
           }
         }
       }
+#pragma omp simd
       for (int c = 0; c < 4; c++) {
         if (lam) {
           hl[c] = fl[c] + fc.a[q] * (l[c] - lv[c]);
           hr[c] = -fr[c] + fc.b[q] * (v[c] - lv[c]);
         } else {
-          hl[c] =
-              (fc.b[q] * fl[c] + fc.a[q] * fr[c] + fc.a[q] * fc.b[q] * (l[c] - v[c])) /
-              (fc.a[q] + fc.b[q]);
+          hl[c] = left_flux_weight * fl[c] + right_flux_weight * fr[c] +
+                  penalty * (l[c] - v[c]);
           hr[c] = -hl[c];
         }
       }
       double scale = dt * fc.length / area * ew[q];
       for (const auto &entry : face_basis[fc.ls][q]) {
-        for (int c = 0; c < 4; ++c) { r[fc.l*m+4*entry.first+c] += scale*entry.second*hl[c]; }
+        double *cell = r.GetData() + fc.l*m + 4*entry.first;
+        const double weight = scale*entry.second;
+#pragma omp simd
+        for (int c = 0; c < 4; ++c) { cell[c] += weight*hl[c]; }
       }
       for (const auto &entry : face_basis[fc.rs][q]) {
-        for (int c = 0; c < 4; ++c) { r[fc.r*m+4*entry.first+c] += scale*entry.second*hr[c]; }
+        double *cell = r.GetData() + fc.r*m + 4*entry.first;
+        const double weight = scale*entry.second;
+#pragma omp simd
+        for (int c = 0; c < 4; ++c) { cell[c] += weight*hr[c]; }
       }
     }
   }
@@ -455,12 +506,15 @@ void Problem::VolumeJacobian(const Vector &u, std::vector<DenseMatrix> &a,
                              const std::vector<Matrix4> *cache_x,
                              const std::vector<Matrix4> *cache_y) const {
   a.resize(n);
-  for (int e = 0; e < n; e++) {
-    a[e].SetSize(m); a[e] = 0.;
+  for(int e=0;e<n;++e) { VolumeJacobianCell(u,e,a[e],cache_x,cache_y); }
+}
+void Problem::VolumeJacobianCell(const Vector &u,int e,DenseMatrix &a,
+    const std::vector<Matrix4> *cache_x,const std::vector<Matrix4> *cache_y) const {
+    a.SetSize(m); a = 0.;
     for (int q = 0; q < V.Height(); q++) {
       if (!cache_x) {
         auto v = Eval(u,e,V,q);
-        jacobian(v,0,jac_x); jacobian(v,1,jac_y);
+        gas.jacobian(v,0,jac_x); gas.jacobian(v,1,jac_y);
       }
       const auto &jx = cache_x ? (*cache_x)[e*V.Height()+q] : jac_x;
       const auto &jy = cache_y ? (*cache_y)[e*V.Height()+q] : jac_y;
@@ -470,21 +524,23 @@ void Problem::VolumeJacobian(const Vector &u, std::vector<DenseMatrix> &a,
         const int end = collocated ? begin + 1 : p;
         for (int j = begin; j < end; ++j) {
           if (V(q,j) == 0) { continue; }
-          for (int c = 0; c < 4; ++c) {
-            for (int d = 0; d < 4; ++d) {
-              a[e](4*i+c,4*j+d) -= dt*w[q]*V(q,j)*
+          const double weight = dt*w[q]*V(q,j);
+          for (int d = 0; d < 4; ++d) {
+#pragma omp simd
+            for (int c = 0; c < 4; ++c) {
+              a(4*i+c,4*j+d) -= weight*
                   (test.dx*jx(c, d) + test.dy*jy(c, d));
             }
           }
         }
       }
     }
-    MassSolve(a[e]);
+    MassSolve(a);
     for (int i = 0; i < m; i++) {
-      a[e](i, i) += 1;
+      a(i, i) += 1;
     }
-  }
 }
+
 std::unique_ptr<ElementOperator> Problem::DG(const Vector &u) const {
   auto op = std::make_unique<ElementOperator>(nu);
   auto vol = VolumeJacobian(u);
@@ -495,13 +551,18 @@ std::unique_ptr<ElementOperator> Problem::DG(const Vector &u) const {
     DenseMatrix ll = zeros(m, m), lr = zeros(m, m), rl = zeros(m, m), rr = zeros(m, m);
     for (int q = 0; q <= opt.k; q++) {
       auto &jl = face_left; auto &jr = face_right;
-      jacobian(Eval(u, f.l, fv[f.ls], q), f.axis, jl);
-      jacobian(Eval(u, f.r, fv[f.rs], q), f.axis, jr);
+      gas.jacobian(Eval(u, f.l, fv[f.ls], q), f.axis, jl);
+      gas.jacobian(Eval(u, f.r, fv[f.rs], q), f.axis, jr);
       double a = f.a[q], b = f.b[q];
-      for (int c = 0; c < 4; c++) {
-        for (int d = 0; d < 4; d++) {
-          jl(c, d) = b / (a + b) * jl(c, d) + (c == d ? a * b / (a + b) : 0);
-          jr(c, d) = a / (a + b) * jr(c, d) - (c == d ? a * b / (a + b) : 0);
+      const double inverse_sum = 1. / (a + b);
+      const double left_weight = b * inverse_sum;
+      const double right_weight = a * inverse_sum;
+      const double penalty = a * b * inverse_sum;
+      for (int d = 0; d < 4; d++) {
+#pragma omp simd
+        for (int c = 0; c < 4; c++) {
+          jl(c, d) = left_weight * jl(c, d) + (c == d ? penalty : 0);
+          jr(c, d) = right_weight * jr(c, d) - (c == d ? penalty : 0);
         }
       }
       double s = dt * f.length / area * ew[q];
@@ -528,37 +589,40 @@ Hybrid Problem::HDG(const Vector &u) const {
   HDG(u, h);
   return h;
 }
-void Problem::HDG(const Vector &u, Hybrid &h) const {
-  require(collocated, "HDG requires the specified GL collocation");
-  VolumeJacobian(u, h.A);
-  h.B.resize(n);
-  h.C.resize(n);
-  h.D.resize(nf);
-  h.ids.resize(n);
-
-  // B and D are constant throughout this implicit time step. Only A and C
-  // contain current-state physical flux derivatives and need every-Newton work.
+void Problem::HybridDiagonal(Hybrid &h) const {
+  h.D.SetSize(nl);
+  // Refresh face stabilization with the current frozen Newton state.
   const bool refresh_static = h.freeze_generation != freeze_generation;
   if (refresh_static) {
     for (int f = 0; f < nf; ++f) {
-      h.D[f].SetSize(t);
-      h.D[f] = 0.;
+
       for (int q = 0; q <= opt.k; ++q) {
         const double diagonal = ew[q] * (faces[f].a[q] + faces[f].b[q]);
         for (int c = 0; c < 4; ++c) {
-          h.D[f](4*q+c, 4*q+c) = diagonal;
+          h.D[f*t+4*q+c] = diagonal;
         }
       }
     }
   }
 
-  for (int e = 0; e < n; ++e) {
-    h.B[e].SetSize(m, 4*t);
-    h.C[e].SetSize(4*t, m);
-    if (refresh_static) {
-      h.B[e] = 0.;
+  h.freeze_generation=freeze_generation;
+}
+void Problem::HDG(const Vector &u, Hybrid &h) const {
+  require(collocated, "HDG requires GL collocation");
+  h.A.resize(n); h.B.resize(n); h.C.resize(n); h.ids.resize(n);
+  HybridDiagonal(h);
+  for(int e=0;e<n;++e) { HybridCell(u,e,h,h.A[e]); }
+}
+void Problem::HybridCell(const Vector &u,int e,Hybrid &h,DenseMatrix &a) const {
+  VolumeJacobianCell(u,e,a);
+    for (auto *coupling : {&h.B[e], &h.C[e]}) {
+      coupling->basis = &face_basis;
+      coupling->inverse_mass = &inv_mass;
+      coupling->nodes = opt.k+1;
+      coupling->cell_size = m;
+      coupling->flux.resize(4*(opt.k+1));
     }
-    h.C[e] = 0.;
+    h.B[e].lift = true; h.C[e].lift = false;
     if (h.ids[e].empty()) {
       h.ids[e].reserve(4*t);
       for (int side = 0; side < 4; ++side) {
@@ -575,9 +639,10 @@ void Problem::HDG(const Vector &u, Hybrid &h) const {
       const double normal_sign = left ? 1. : -1.;
       for (int q = 0; q <= opt.k; ++q) {
         auto &derivative = face_left;
-        jacobian(Eval(u, e, fv[side], q), face.axis, derivative);
+        gas.jacobian(Eval(u, e, fv[side], q), face.axis, derivative);
         const double stabilization = left ? face.a[q] : face.b[q];
         for (int d = 0; d < 4; ++d) {
+#pragma omp simd
           for (int c = 0; c < 4; ++c) {
             derivative(c,d) = normal_sign*derivative(c,d) +
                               (c == d ? stabilization : 0.);
@@ -587,42 +652,32 @@ void Problem::HDG(const Vector &u, Hybrid &h) const {
         // Trace basis is nodal: only column/node q contributes. Accumulate
         // inverse-mass-scaled A/B rows directly, without dense face scratch.
         const double scale = dt * face.length / area * ew[q];
-        const int trace_node = side*t + 4*q;
         const auto &restriction = face_basis[side][q];
         for (const auto &test : restriction) {
           const int i = test.first;
           const double row_weight = scale*test.second*inv_mass(i,i);
-          if (refresh_static) {
-            for (int c = 0; c < 4; ++c) {
-              h.B[e](4*i+c, trace_node+c) -= row_weight*stabilization;
-            }
-          }
           for (const auto &trial : restriction) {
             const int j = trial.first;
             const double value_weight = row_weight*trial.second;
             for (int d = 0; d < 4; ++d) {
+#pragma omp simd
               for (int c = 0; c < 4; ++c) {
-                h.A[e](4*i+c, 4*j+d) += value_weight*derivative(c,d);
+                a(4*i+c, 4*j+d) += value_weight*derivative(c,d);
               }
             }
           }
         }
-        // Skeleton rows have neither dt nor physical face length. The sign
-        // matches g = g_R - g_L, so the trace penalty D is positive.
-        for (const auto &trial : restriction) {
-          const int j = trial.first;
-          const double weight = -ew[q]*trial.second;
-          for (int d = 0; d < 4; ++d) {
-            for (int c = 0; c < 4; ++c) {
-              h.C[e](trace_node+c, 4*j+d) += weight*derivative(c,d);
-            }
+        for (int d=0; d<4; ++d) {
+          for (int c=0; c<4; ++c) {
+            h.B[e].flux[side*(opt.k+1)+q](c,d) =
+                c==d ? -scale*stabilization : 0.;
+            h.C[e].flux[side*(opt.k+1)+q](c,d) = -ew[q]*derivative(c,d);
           }
         }
       }
     }
-  }
-  h.freeze_generation = freeze_generation;
 }
+
 std::array<double, 4> Problem::Errors(const Vector &u, double time) const {
   std::array<double, 4> a{};
   const auto &ir =
@@ -632,7 +687,7 @@ std::array<double, 4> Problem::Errors(const Vector &u, double time) const {
     for (int q = 0; q < ir.GetNPoints(); q++) {
       auto &ip = ir.IntPoint(q);
       fe->CalcShape(ip, sh);
-      auto v = exact(origx[e] + hx * ip.x, origy[e] + hy * ip.y, time, alpha);
+      auto v = gas.exact(origx[e] + hx * ip.x, origy[e] + hy * ip.y, time, alpha);
       for (int c = 0; c < 4; c++) {
         double z = 0;
         for (int i = 0; i < p; i++) {
@@ -658,15 +713,28 @@ std::array<double, 4> Problem::Integral(const Vector &u) const {
   }
   return a;
 }
-double Problem::Difference(const Vector &u, const Vector &v) const {
-  double a = 0;
+std::array<double, 4> Problem::Differences(const Vector &u, const Vector &v) const {
+  require(u.Size() == nu && v.Size() == nu, "Solution difference size mismatch");
+  std::array<double, 4> a{};
+  const auto &ir =
+      mfem::IntRules.Get(mfem::Geometry::SQUARE, std::max(24, 2 * opt.k + 8));
+  Vector sh(p);
   for (int e = 0; e < n; e++) {
-    for (int q = 0; q < V.Height(); q++) {
-      auto x = Eval(u, e, V, q), y = Eval(v, e, V, q);
-      a += area * w[q] * (x[0] - y[0]) * (x[0] - y[0]);
+    for (int q = 0; q < ir.GetNPoints(); q++) {
+      const auto &ip = ir.IntPoint(q);
+      fe->CalcShape(ip, sh);
+      for (int c = 0; c < 4; ++c) {
+        double difference = 0.;
+        for (int i = 0; i < p; ++i) {
+          difference += sh[i] * (u[e*m+4*i+c] - v[e*m+4*i+c]);
+        }
+        a[c] += area * ip.weight * difference * difference;
+      }
     }
   }
-  return std::sqrt(a);
+  std::transform(a.begin(), a.end(), a.begin(),
+                 [](double value) { return std::sqrt(value); });
+  return a;
 }
 void Problem::Save(const Vector &u, const std::string &prefix) const {
   std::ofstream ms(prefix + ".mesh");

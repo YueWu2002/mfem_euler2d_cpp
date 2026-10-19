@@ -55,6 +55,8 @@ Options ParseOptions(int argc, char **argv) {
       o.form = value();
     } else if (s == "--solver") {
       o.solver = value();
+    } else if (s == "--integrator") {
+      o.integrator = value();
     } else if (s == "--precond") {
       o.precond = value();
     } else if (s == "--output") {
@@ -80,8 +82,9 @@ Options ParseOptions(int argc, char **argv) {
           "--nx N --ny N --k 0..8 --alpha-deg A (default 45)\n"
           "--dt DT | --cfl C (CFL wins; h=min(hx,hy), speed includes safety)\n"
           "--T T (default .2) | --steps N (steps wins; no T clipping)\n"
-          "--max-newton N --newton-tol E | --newton-steps N (fixed updates/step)\n"
-          "--form dg|hdg|both --solver gmres|direct|dense\n"
+          "--max-newton N --newton-tol E | --newton-steps N (fixed updates/stage)\n"
+          "--form dg|hdg|both --integrator ssp-dirk3|be\n"
+          "--solver gmres|direct|dense (direct is MKL PARDISO)\n"
           "--precond block-jacobi|block-ilu0 --ilu-ordering none|mdf\n"
           "--assembly full|element|partial --matrix-free --safety 1.1\n"
           "--linear-tol E --restart N --max-krylov N --output PREFIX\n"
@@ -103,6 +106,8 @@ Options ParseOptions(int argc, char **argv) {
               std::isfinite(o.linear_tol),
           "Nonfinite option");
   require(o.form == "dg" || o.form == "hdg" || o.form == "both", "Invalid form");
+  require(o.integrator == "ssp-dirk3" || o.integrator == "be",
+          "Invalid time integrator");
   require(o.solver == "gmres" || o.solver == "direct" || o.solver == "dense",
           "Invalid solver");
   require(o.restart > 0 && o.max_krylov > 0 && o.max_newton > 0,

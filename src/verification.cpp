@@ -2,11 +2,14 @@
 #include <algorithm>
 #include <iostream>
 namespace euler {
-void VerifyPhysics();
+void VerifyPhysics(const EulerGas &gas);
 void VerifyWeighted(const Options &base);
-void Verify(const Options &base) {
-  VerifyPhysics();
+void Verify(const Options &base, const EulerGas &gas) {
+  VerifyPhysics(gas);
   VerifyWeighted(base);
+  std::ofstream storage(base.output + "_storage.csv");
+  storage << "k,dg_bsr_ilu_relative,hdg_bsr_ilu_relative,streamed_schur_relative,"
+             "schur_diagonal_relative\n" << std::setprecision(17);
   std::ofstream report(base.output + "_verification.csv");
   report << "k,jacobian_fd_relative,dg_hdg_increment_relative,assembled_mf_"
             "relative,mass_off_diagonal,partial_dg_relative,partial_schur_"
@@ -19,9 +22,9 @@ void Verify(const Options &base) {
     o.precond = "block-jacobi";
     o.matrix_free = o.solver == "gmres";
     o.linear_tol = 1e-12;
-    Problem p(o);
+    Problem p(o, gas);
     Vector u = p.Initial();
-    auto background = exact(0, 0, 0, p.alpha);
+    auto background = gas.exact(0, 0, 0, p.alpha);
     for (int i = 0; i < p.nu; i++) {
       u[i] = .05 * u[i] + .95 * background[i % 4];
     }
@@ -57,21 +60,78 @@ void Verify(const Options &base) {
     hd -= d.x;
     double equiv = hd.Norml2() / d.x.Norml2();
     auto pa = p.PartialDG(u);
+    auto streamed = pa->Assemble();
+    streamed->Mult(v,az);
+    az -= z;
+    require(az.Norml2()/z.Norml2()<1e-12,
+            "Streaming tensor DG CSR differs from reference");
+    for (int e=0; e<p.n; ++e) {
+      for (const auto *coupling : {&h.B[e], &h.C[e]}) {
+        DenseMatrix expanded;
+        coupling->Dense(expanded);
+        Vector input(coupling->Width()), actual, expected(coupling->Height());
+        for (int i=0; i<input.Size(); ++i) { input[i]=std::sin(.19*(i+1)); }
+        coupling->Mult(input,actual);
+        expanded.Mult(input,expected);
+        actual-=expected;
+        require(actual.Norml2()<1e-12*std::max(1.,expected.Norml2()),
+                "Tensor face action differs from expanded matrix");
+      }
+    }
     Vector pz(p.nu);
     pa->Mult(v, pz);
     pz -= z;
     double parel = pz.Norml2() / z.Norml2();
     Options po = o;
     po.assembly = "partial";
-    Problem pp(po);
+    Problem pp(po, gas);
     pp.Freeze(u, .001);
     auto ph = pp.HDG(u);
     auto ps = pp.Condense(ph, hr);
+    auto check_ilu = [&](const ElementOperator &op,int block) {
+      FixedBlockILU test(op.BlockGraph(block),block,"none");
+      auto csr=op.Assemble();
+      Vector input(op.Height()), actual(op.Height()), expected(op.Height());
+      for(int i=0;i<input.Size();++i) { input[i]=std::sin(.17*(i+1)); }
+      double maximum=0.;
+      for(int repeat=0;repeat<2;++repeat) {
+        // Refill overwritten factors: verifies reuse without graph reconstruction.
+        op.FillBlocks(test); test.Factor(); test.Mult(input,actual);
+        mfem::BlockILU native(*csr,block,mfem::BlockILU::Reordering::NONE,0);
+        native.Mult(input,expected); actual-=expected;
+        maximum=std::max(maximum,actual.Norml2()/expected.Norml2());
+        input*=.7;
+      }
+      require(maximum<1e-10,"Direct BSR ILU differs from native fixed-order ILU");
+      return maximum;
+    };
+    const double dg_ilu=check_ilu(*pa,p.m), hdg_ilu=check_ilu(*ps.op,pp.t);
+    Hybrid streamed_h; Condensed streamed_s;
+    pp.PrepareHybrid(streamed_h,streamed_s);
+    pp.StreamCondense(u,hr,streamed_h,streamed_s);
+    require(streamed_h.A.empty() && streamed_s.cell_matrix.Height()==pp.m,
+            "Production HDG retained all cell matrices");
+    const auto sd=streamed_s.op->DiagonalBlocks(pp.t);
+    double diag_error=0.,diag_scale=0.;
+    for(int f=0;f<pp.nf;++f) {
+      auto reference=ps.op->DiagonalBlock(f*pp.t,pp.t);
+      for(int j=0;j<pp.t;++j) { for(int i=0;i<pp.t;++i) {
+        diag_error=std::max(diag_error,std::abs(sd[f](i,j)-reference(i,j)));
+        diag_scale=std::max(diag_scale,std::abs(reference(i,j)));
+      } }
+    }
+    require(diag_error<1e-12*std::max(1.,diag_scale),"Panel-only Schur diagonal differs");
     Vector sz(ps.op->Height()), ez(s.op->Height());
     for (int i = 0; i < sz.Size(); i++) {
       sz[i] = std::sin(.27 * i);
     }
     ps.op->Mult(sz, ez);
+    Vector streamed_value(ez.Size());
+    streamed_s.op->Mult(sz,streamed_value); streamed_value-=ez;
+    const double streamed_error=streamed_value.Norml2()/ez.Norml2();
+    require(streamed_error<1e-12,"Streaming Schur differs from reference");
+    storage << k << ',' << dg_ilu << ',' << hdg_ilu << ',' << streamed_error
+            << ',' << diag_error/std::max(1.,diag_scale) << std::endl;
     Vector ref(ez.Size());
     s.op->Mult(sz, ref);
     ez -= ref;
@@ -194,16 +254,43 @@ void VerifyWeighted(const Options &base) {
 }
 
 // One-sided Einfeldt/HLL branches and the exact homogeneous Euler PDE.
-void VerifyPhysics() {
+void VerifyPhysics(const EulerGas &gas) {
+  const double configured_gamma = gas.Gamma();
+  for (double value : {1.4, 1.67, configured_gamma}) {
+    const EulerGas test_gas(value);
+    State u{1.2, .3, -.2, 3.};
+    const double expected_pressure = (value-1.)*(3.-.5*(.3*.3+.2*.2)/1.2);
+    require(std::abs(test_gas.pressure(u)-expected_pressure) < 1e-14,
+            "Parameterized pressure failed");
+    for (int axis = 0; axis < 2; ++axis) {
+      Matrix4 j;
+      test_gas.jacobian(u, axis, j);
+      for (int c = 0; c < 4; ++c) {
+        State up = u, um = u;
+        up[c] += 1e-6; um[c] -= 1e-6;
+        auto fp = test_gas.flux(up, axis), fm = test_gas.flux(um, axis);
+        for (int d = 0; d < 4; ++d) {
+          require(std::abs((fp[d]-fm[d])/2e-6-j(d,c)) < 1e-8,
+                  "Parameterized flux Jacobian failed");
+        }
+      }
+      const double sound = std::sqrt(value*expected_pressure/u[0]);
+      const double velocity = u[axis+1]/u[0];
+      auto bounds = test_gas.speeds(u,u,axis,1.1);
+      require(std::abs(bounds[0]-1.1*(sound-velocity)) < 1e-12 &&
+                  std::abs(bounds[1]-1.1*(sound+velocity)) < 1e-12,
+              "Parameterized HLL sound speed failed");
+    }
+  }
   State l{1, 5, -5, 25.5}, r{1.1, 5.5, -5.5, 28.};
-  require(speeds(l, r, 0, 1.1)[0] == 0 && speeds(l, r, 1, 1.1)[1] == 0,
+  require(gas.speeds(l, r, 0, 1.1)[0] == 0 && gas.speeds(l, r, 1, 1.1)[1] == 0,
           "One-sided HLL branch failed");
   double eps = 1e-6, maxerr = 0;
   for (int i = 0; i < 20; i++) {
     double x = .07 * i, y = .13 * i, t = .07, a = pi / 6;
-    auto ut1 = exact(x, y, t + eps, a), ut0 = exact(x, y, t - eps, a);
-    auto fx1 = flux(exact(x + eps, y, t, a), 0), fx0 = flux(exact(x - eps, y, t, a), 0),
-         fy1 = flux(exact(x, y + eps, t, a), 1), fy0 = flux(exact(x, y - eps, t, a), 1);
+    auto ut1 = gas.exact(x, y, t + eps, a), ut0 = gas.exact(x, y, t - eps, a);
+    auto fx1 = gas.flux(gas.exact(x + eps, y, t, a), 0), fx0 = gas.flux(gas.exact(x - eps, y, t, a), 0),
+         fy1 = gas.flux(gas.exact(x, y + eps, t, a), 1), fy0 = gas.flux(gas.exact(x, y - eps, t, a), 1);
     for (int c = 0; c < 4; c++) {
       maxerr = std::max(
           maxerr,

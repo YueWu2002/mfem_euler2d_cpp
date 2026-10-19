@@ -1,5 +1,7 @@
 /build*/
-/results/
+/accuracy_test/*
+!/accuracy_test/convergence.py
+/code_test/results/
 /output/
 /tmp/
 /.cache/
@@ -8,11 +10,15 @@ __pycache__/
 *.log
 *.exe
 *.o
+*.out
+*.err
 *.obj
 *.a
 *.lib
 *.dll
 *.so
+*.optrpt
+perf.data*
 *.mesh
 *.gf
 *_coefficients.csv
@@ -22,3 +28,9 @@ __pycache__/
 *_verification.csv
 *_weighted_gmres.csv
 note-extracted.txt
+
+# Speed-test sources and documentation are versioned; ignore generated artifacts.
+/speed_test/build/
+/speed_test/slurm/
+/speed_test/results/*
+!/speed_test/results/*.md

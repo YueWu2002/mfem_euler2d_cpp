@@ -18,15 +18,23 @@ The first shock time is `1/pi`. Each domain translation changes z by 2, so
 periodicity is compatible with every supported angle, not only pi/4.
 The supported box has positive lengths and requires `0<alpha<pi/2`.
 
-## Target DG equation
+## Semidiscrete DG equation and DIRK stages
 
 Use Qk GL nodal basis functions and exactly `(k+1)^2` tensor GL volume points;
 use `k+1` shared GL points on each face. All four components share the scalar
-basis. With physical cell Gram matrix `M_K=area*M_ref`, backward Euler is
+basis. With physical cell Gram matrix `M_K=area*M_ref`, write the semidiscrete
+method as `dU/dt=L_h(U)`. A diagonally implicit RK stage has affine base
 
 \[
- r_K^w=M_K(U_K-U_K^n)-\Delta t\,(F(U),\nabla\phi)_K
-       +\Delta t\,\langle\widehat F_{K},\phi\rangle_{\partial K}=0.
+ U_i^0=U^n+\Delta t\sum_{j<i}a_{ij}K_j,\qquad K_j=L_h(U_j),
+\]
+
+and solves a backward-Euler-shaped equation with
+`delta_i=a_ii*Delta t`:
+
+\[
+ r_{K,i}^w=M_K(U_{K,i}-U_{K,i}^0)-\delta_i\,(F(U_i),\nabla\phi)_K
+       +\delta_i\,\langle\widehat F_{K},\phi\rangle_{\partial K}=0.
 \]
 
 The code stores `r_K=M_K^{-1}r_K^w`. This is a row scaling of the same DG
@@ -35,6 +43,24 @@ quadrature mass is diagonal and exact on products of Qk basis functions.
 The nonlinear flux integrals are the specified collocated quadrature, not an
 exact nonlinear integral or an overintegrated variant. Initial projection and
 final error evaluation use a separate accurate rule outside the time loop.
+
+The default four-stage SSP-DIRK3 tableau is
+
+\[
+\begin{array}{c|cccc}
+\alpha&\alpha&0&0&0\\
+0&-\alpha&\alpha&0&0\\
+1&0&1-\alpha&\alpha&0\\
+1/2&\beta&\eta&1/2-\beta-\eta-\alpha&\alpha\\ \hline
+&0&1/6&1/6&2/3
+\end{array}
+\]
+
+where `alpha=0.24169426078821`, `beta=alpha/4`, and
+`eta=0.12915286960590`. The code recovers
+`K_i=(U_i-U_i^0)/(alpha*Delta t)` and forms the final weighted combination.
+The tableau satisfies the third-order RK conditions. Backward Euler remains
+available through `--integrator be`.
 
 At a face with fixed positive-axis normal, define `a=-SL>=0`, `b=SR>=0`.
 With square-root-density Roe averages,
@@ -46,8 +72,37 @@ With square-root-density Roe averages,
 
 Here `c=sqrt(3p/rho)`, and Roe sound speed comes from the averaged total
 enthalpy and full velocity. These are exactly the reference implementations'
-Einfeldt bounds. Freeze a,b from the preceding time level throughout Newton,
-GMRES and line search. The physical flux is still nonlinear in the current U.
+Einfeldt bounds. Recompute a,b from the current state for every nonlinear
+residual, including line-search trial states. Freeze a,b only in the linear
+solve at that state: the matrix omits derivatives of the bounds and is thus a
+quasi-Newton matrix. The converged stage solves the current-state HLL residual,
+not an old-time frozen-flux equation. DG and condensed HDG use exactly the
+same frozen-bound matrix at each update; all bound-dependent HDG blocks are
+invalidated whenever the bounds change. CFL uses the beginning-of-step bounds.
+
+### Accuracy limitation of the former whole-step freezing
+
+Write the spatial ODE as `U'=F(U,s(U))`, where `s` collects the HLL bounds.
+The former implementation instead applied the RK tableau to `U'=F(U,s(U_n))`.
+For differentiable bounds, the exact second-order Taylor coefficient is
+`(F_U + F_s s_U) F / 2`, while the frozen step contains only `F_U F / 2`.
+Thus the local defect generically contains
+`Delta t^2 F_s s_U F / 2`: fixed-grid global time accuracy is only first
+order, even though the tableau satisfies all third-order RK conditions.
+At switches in the max-based bounds this smooth Taylor argument is local;
+For consistent HLL fluxes, sensitivity to the bounds vanishes when left and
+right states coincide. This explains why the freezing error can be small on
+spatial refinement and hidden beneath the spatial error.
+
+Freezing through all stages is different from freezing only within a stage's
+nonlinear solve with suitably accurate stage-dependent speed predictions.
+The current implementation removes this defect by solving with state-dependent
+bounds, while retaining frozen bounds in the quasi-Newton matrix. DG/HDG
+equivalence was retested. The CLI name `ssp-dirk3` does not itself
+establish an SSP/positivity theorem for the complete scheme.
+
+### Oriented numerical flux
+
 The oriented HLL flux is
 
 \[
@@ -144,6 +199,46 @@ weighted Arnoldi implementation, with reusable MFEM vectors/matrices.
 | DG | `M^{-1} e_w` | `M e_s` | `M=area*M_ref` |
 | HDG Schur | `ell_f^{-1} e_w` | `ell_f e_s` | `ell_f/w_q` per nodal component |
 
+## Reported solution-error norms
+
+The body coefficients are nodal values at the tensor-product Gauss--Legendre
+nodes of each discontinuous Qk cell. For final DG and HDG body solutions,
+`max_nodal_difference` is
+
+\[
+ \max_{K,i,c}|U^{DG}_{K,i,c}-U^{HDG}_{K,i,c}|,
+\]
+
+over every cell K, every local GL body node i, and all four conservative
+components `rho`, `rhou`, `rhov`, and `E`. Values on geometrically coincident
+DG traces remain distinct cell-local nodes; each local copy participates in
+the maximum. This is a coefficient/node infinity norm, not a physical L2 norm.
+
+For each component c, reconstruct the Qk polynomial inside every cell and
+measure the exact-solution error as
+
+\[
+ e_c=\left[\sum_K\int_K
+   \big(U_{h,c}(x)-U_{exact,c}(x,T)\big)^2\,dx\right]^{1/2}.
+\]
+
+The DG--HDG component difference replaces the exact solution above by the
+other reconstructed polynomial. Both calculations use MFEM's square rule of
+order `max(24,2*k+8)`, independently of the 3x3 production residual rule, and
+multiply reference weights by the affine physical-cell area. The joint
+solution difference is
+
+\[
+ \|U^{DG}-U^{HDG}\|_{L^2,components}
+ =\sqrt{\|\delta\rho\|_{L^2}^2+\|\delta(\rho u)\|_{L^2}^2
+       +\|\delta(\rho v)\|_{L^2}^2+\|\delta E\|_{L^2}^2}.
+\]
+
+No normalization by the exact-solution norm or domain area is applied: all
+reported solution L2 errors and DG--HDG L2 differences are absolute physical-
+domain norms. These solution-error norms are separate from the inverse-mass
+dual residual norm used by Newton and weighted GMRES.
+
 The HDG Gram is `H_trace=diag(ell_f*w_q)`, counting each global face once.
 A physically scaled cell residual is `r_w/dt`; therefore nonlinear convergence
 uses `sqrt(r_stored^T M r_stored)/dt/sqrt(domain area)`. The common relative
@@ -156,9 +251,18 @@ when vertical and horizontal face lengths differ.
 Block Jacobi uses exact diagonal blocks J_KK for DG and **S_ff**, including
 local elimination contributions, for HDG; it does not use D_ff alone.
 Fixed-order block ILU(0) is also covariant under local block basis changes in
-exact arithmetic when the full block sparsity pattern is fixed. MDF can change
-the block ordering under basis changes because it depends on numerical block
-norms; use `--ilu-ordering none` for invariance comparisons.
+exact arithmetic when the full block sparsity pattern is fixed. Production
+`--ilu-ordering mdf` now applies MDF once to the unweighted topology graph,
+so this permutation is fixed and independent of numerical block norms and
+basis changes. This differs from numerical MDF on each Newton matrix.
+The reference invariance comparisons use `--ilu-ordering none`.
+
+Production BSR ILU(0) retains the prescribed cell/face block graph, updates only
+existing blocks, and factors each updated diagonal once with partial pivoting.
+The block graph, permutation and elimination schedule are symbolic preparation;
+numeric block assembly and factorization remain part of every Newton update.
+HDG can stream the cell assembly/factorization because Schur action and recovery
+need only X_K and y_K afterwards. This changes neither local solves nor S.
 
 For a nonorthogonal local basis transformation T, use `K'=T^T K T`,
 `b'=T^T b`, `H'=T^T H T`. H' is generally dense and **must not be replaced by
